@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release zip
+        run: |
+          mkdir -p dist/zs-fleet
+          cp zs-fleet.php dist/zs-fleet/
+          cp -r modules dist/zs-fleet/
+          cp deploy/zs-fleet-loader.php dist/
+          cp README.md dist/zs-fleet/
+          cd dist
+          zip -r "zs-fleet-${GITHUB_REF_NAME}.zip" zs-fleet zs-fleet-loader.php
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/zs-fleet-*.zip
+          generate_release_notes: true
