@@ -14,6 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: PHP syntax check
+        run: |
+          # Lint every PHP file shipped to fleet sites. A syntax error
+          # in any one would break the auto-update on all 21 sites at
+          # once, so this is a hard gate before the release zip is
+          # built.
+          set -e
+          find zs-fleet.php modules deploy -name '*.php' -print0 \
+            | xargs -0 -n1 php -l
+
       - name: Build release zip
         run: |
           mkdir -p dist/zs-fleet
@@ -29,3 +39,9 @@ jobs:
         with:
           files: dist/zs-fleet-*.zip
           generate_release_notes: true
+          # Tags with a hyphen suffix (v0.2.0-canary, v0.2.0-rc1) are
+          # published as prereleases. The auto-updater queries
+          # /releases/latest, which excludes prereleases — so prerelease
+          # tags are visible on GitHub but invisible to fleet sites.
+          # That is the canary mechanism.
+          prerelease: ${{ contains(github.ref_name, '-') }}

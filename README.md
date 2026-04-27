@@ -31,6 +31,7 @@ file at top level `require_once`s the bootstrap inside the directory.
 |---------------------|---------------------------------------------------------|
 | `no-admin-mods`     | Blocks plugin/theme/core install/update/delete from wp-admin browser. Whitelisted operator emails, MainWP Child, WP-CLI and WP-Cron continue to work. |
 | `disable-xmlrpc`    | Disables XML-RPC site-wide (xmlrpc_enabled false + empty methods array + no RSD link + no X-Pingback header). |
+| `auto-update`       | Daily WP_Cron pulls new releases from GitHub. Atomic swap, prereleases ignored. |
 
 ## Per-site opt-out
 
@@ -55,6 +56,7 @@ Currently exposed flags:
 | Module            | Filter                                |
 |-------------------|---------------------------------------|
 | `disable-xmlrpc`  | `zs_fleet_disable_xmlrpc_enabled`     |
+| `auto-update`     | `zs_fleet_auto_update_enabled`        |
 
 When you add a new module, follow the same pattern: gate every hook
 on `apply_filters('zs_fleet_<slug>_enabled', true)` returning truthy,
@@ -72,23 +74,41 @@ if ordering matters.
 
 ## Deployment to a site
 
-First-time install:
+First-time install (manual via panel or SFTP):
 
 ```bash
 # 1. Get a release zip (or git clone)
-gh release download v0.1.0 --repo marcorubiol/zs-fleet
+gh release download v0.1.4 --repo marcorubiol/zs-fleet
 
 # 2. Upload to mu-plugins/
 scp deploy/zs-fleet-loader.php  site:/path/to/wp-content/mu-plugins/
 scp -r zs-fleet/                site:/path/to/wp-content/mu-plugins/
 ```
 
-Update:
+After first install: nothing to do. `auto-update` runs daily via
+WP_Cron, pulls new GitHub releases, swaps the directory atomically.
+
+To force an update right now (e.g. just published a fix):
 
 ```bash
-# Replace the directory in place; loader stays.
-ssh site 'rm -rf /path/to/wp-content/mu-plugins/zs-fleet'
-scp -r zs-fleet/ site:/path/to/wp-content/mu-plugins/
+ssh site 'wp --path=/path/to/wp cron event run zs_fleet_auto_update_check'
+```
+
+## Canary releases
+
+A tag with a hyphen suffix is treated as a prerelease and ignored
+by the fleet auto-updater:
+
+```bash
+git tag v0.2.0-canary
+git push origin v0.2.0-canary   # built, published as PRERELEASE, NOT applied
+```
+
+Test in Local. When validated, promote:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0          # published as latest, applied within 24h
 ```
 
 ## Removing from a site
