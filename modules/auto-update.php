@@ -55,7 +55,69 @@ const ZS_FLEET_AU_OPT_ERROR   = 'zs_fleet_au_last_error';
 const ZS_FLEET_AU_LOCK        = 'zs_fleet_au_lock';
 
 add_action( 'init', 'zs_fleet_au_schedule' );
+add_action( 'init', 'zs_fleet_au_handle_push_trigger', 5 );
 add_action( ZS_FLEET_AU_HOOK, 'zs_fleet_au_run' );
+
+/**
+ * Public on-demand trigger: GET /?zs_fleet_check_now=1
+ *
+ * Lets the operator (or a CI script) push a new release to the
+ * fleet without waiting up to 24h for the daily WP_Cron to fire.
+ * After tagging a new version, hit this URL on each fleet site —
+ * within seconds the site downloads, compares, and swaps.
+ *
+ * Why no auth: the work this triggers is idempotent (download +
+ * version-compare + maybe rename). If the version on disk already
+ * matches the latest release, the downloaded zip is discarded — no
+ * state change. The internal transient lock caps one real execution
+ * per 5 minutes per site, so the worst an attacker can do is
+ * waste ~12 KB of GitHub bandwidth per 5 minutes per site.
+ *
+ * Output is plain text so a shell script can grep the result:
+ *
+ *   version_before: 0.1.5
+ *   version_after:  0.1.6
+ *   updated:        yes
+ */
+function zs_fleet_au_handle_push_trigger() {
+	if ( ! isset( $_GET['zs_fleet_check_now'] ) ) {
+		return;
+	}
+	if ( ! apply_filters( 'zs_fleet_auto_update_enabled', true ) ) {
+		status_header( 403 );
+		nocache_headers();
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		echo "auto-update disabled at this site\n";
+		exit;
+	}
+
+	nocache_headers();
+	header( 'Content-Type: text/plain; charset=utf-8' );
+
+	$before = ZS_FLEET_VERSION;
+	zs_fleet_au_run();
+
+	// Re-read the on-disk version. If the swap just happened, this
+	// will reflect the newly installed bootstrap.
+	$after_path = WPMU_PLUGIN_DIR . '/zs-fleet/zs-fleet.php';
+	$after      = '';
+	if ( file_exists( $after_path ) ) {
+		$contents = @file_get_contents( $after_path, false, null, 0, 2048 );
+		if ( $contents && preg_match( '/^\s*\*\s*Version:\s*(\S+)/m', $contents, $m ) ) {
+			$after = $m[1];
+		}
+	}
+
+	echo "version_before: {$before}\n";
+	echo 'version_after:  ' . ( $after ?: '(unknown)' ) . "\n";
+	echo 'updated:        ' . ( $after && $after !== $before ? 'yes' : 'no' ) . "\n";
+
+	$err = get_option( ZS_FLEET_AU_OPT_ERROR );
+	if ( is_array( $err ) && ! empty( $err['msg'] ) ) {
+		echo "last_error:     {$err['msg']}\n";
+	}
+	exit;
+}
 
 function zs_fleet_au_schedule() {
 	if ( ! apply_filters( 'zs_fleet_auto_update_enabled', true ) ) {

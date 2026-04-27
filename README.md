@@ -99,11 +99,27 @@ scp    zs-fleet-loader.php      site:/path/to/wp-content/mu-plugins/
 ```
 
 To force an update right now (e.g. just published a fix and don't
-want to wait the daily cron):
+want to wait the daily cron) — hit the public trigger URL:
 
 ```bash
-ssh site 'wp --path=/path/to/wp cron event run zs_fleet_auto_update_check'
+curl -s "https://site.example/?zs_fleet_check_now=1"
+# version_before: 0.1.5
+# version_after:  0.1.6
+# updated:        yes
 ```
+
+For the whole fleet, use the included push script (manifest at
+`deploy/fleet.txt`):
+
+```bash
+./deploy/fleet-push.sh           # all sites
+./deploy/fleet-push.sh paellasencasa.com   # one site
+```
+
+The trigger is idempotent: if the site is already on the latest
+version the downloaded zip is discarded. An internal 5-minute
+transient lock caps how often the real work can run, so the URL
+is safe to expose without auth.
 
 ## Canary releases
 
