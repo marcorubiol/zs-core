@@ -14,48 +14,75 @@
  * paellas only — this module replaces that ad-hoc fix with a
  * fleet-wide default.
  *
+ * Why we kill the request instead of just filtering methods
+ * ---------------------------------------------------------
+ * The naïve approach is `xmlrpc_enabled` + `xmlrpc_methods → []`. It
+ * does NOT work. `xmlrpc_enabled` only blocks methods that require
+ * authentication. The IXR_Server core ships with three system methods
+ * (system.listMethods, system.multicall, system.getCapabilities) that
+ * are hardcoded after the `xmlrpc_methods` filter runs, and none of
+ * them require auth — so a `system.listMethods` POST still gets a
+ * 200 OK with the three system methods listed, which means the bot
+ * still gets a useful endpoint.
+ *
+ * To actually disable XML-RPC we have to short-circuit the request
+ * before IXR_Server is constructed. The XMLRPC_REQUEST constant is
+ * defined by xmlrpc.php at the very top, before wp-load.php. By the
+ * time MU-plugins fire on `plugins_loaded`, WP is loaded but the
+ * server hasn't been instantiated yet — perfect window to die.
+ *
  * What it does
  * ------------
- *   1. xmlrpc_enabled  → false        (disables the endpoint entirely)
- *   2. xmlrpc_methods  → empty array  (belt-and-braces; if anything
- *                                       slips past #1, every method is
- *                                       a no-op)
- *   3. removes the RSD link from <head> (no advertising of the endpoint)
- *   4. strips the X-Pingback HTTP header (same reason)
- *
- * What this does NOT do
- * ---------------------
- *   - It does NOT block the request at the web-server layer. lsphp
- *     still spawns and WordPress still boots before responding "disabled".
- *     That is enough at current attack cadence (1-2 req/s observed)
- *     but a future-proof defense would be a Cloudflare WAF rule or
- *     an .htaccess deny — neither of those belongs in a WP plugin.
+ *   1. On plugins_loaded, if XMLRPC_REQUEST is set: 403 + exit.
+ *   2. Belt-and-braces: xmlrpc_enabled false + empty xmlrpc_methods.
+ *   3. Removes the RSD link from <head> (no advertising of endpoint).
+ *   4. Strips the X-Pingback HTTP header (same reason).
  *
  * Compatibility
  * -------------
- *   - MainWP Child uses REST in current versions, NOT XML-RPC, so this
- *     does not break fleet management.
- *   - Jetpack would be affected if installed (it depends on XML-RPC).
- *     Not in the agency stack as of 2026-04, so not a concern. If
- *     Jetpack ever gets added to a site, that site needs an exception.
- *   - Mobile WordPress app uses XML-RPC and will stop working. Not used
- *     by the agency operator.
+ *   - MainWP Child uses REST in current versions, NOT XML-RPC, so
+ *     this does not break fleet management.
+ *   - Jetpack would be affected (depends on XML-RPC). Not in agency
+ *     stack as of 2026-04. If ever added, that site needs an
+ *     exception module.
+ *   - Mobile WordPress app uses XML-RPC and will stop working. Not
+ *     used by the agency operator.
  *
  * To carve out an exception per-site
  * ----------------------------------
- * Drop a sibling module (e.g. modules/zz-allow-xmlrpc-jetpack.php) that
- * runs late and adds add_filter('xmlrpc_enabled', '__return_true', 999);
- * The "zz-" prefix is a deliberate alphabetical hack to ensure it loads
- * after this one.
+ * Drop a sibling module zz-allow-xmlrpc.php that runs late and
+ * remove_action()s the kill switch:
+ *   remove_action('plugins_loaded', 'zs_disable_xmlrpc_kill', 1);
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
+/**
+ * Hard kill of any /xmlrpc.php request. Runs at priority 1 on
+ * plugins_loaded — early enough to fire before wp_xmlrpc_server is
+ * instantiated by xmlrpc.php (which only happens after all plugins
+ * are loaded), late enough that WP is bootstrapped enough for
+ * status_header() and wp_die() to work cleanly.
+ */
+function zs_disable_xmlrpc_kill() {
+	if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
+		status_header( 403 );
+		nocache_headers();
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		echo "XML-RPC services are disabled on this site.\n";
+		exit;
+	}
+}
+add_action( 'plugins_loaded', 'zs_disable_xmlrpc_kill', 1 );
+
+// Belt-and-braces below — should never matter once kill above fires,
+// but cheap defense-in-depth in case of future WP changes.
+
 add_filter( 'xmlrpc_enabled', '__return_false' );
 
-add_filter( 'xmlrpc_methods', function ( $methods ) {
+add_filter( 'xmlrpc_methods', function () {
 	return array();
 }, 999 );
 
