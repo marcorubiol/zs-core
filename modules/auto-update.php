@@ -6,14 +6,13 @@
  * atomically. Runs daily via WP_Cron.
  *
  * Why: 21+ sites in the fleet. Manual updates per site doesn't scale.
- * GitHub is the source of truth; each site polls for new tags daily
- * and pulls them down.
+ * GitHub is the source of truth; each site polls for new releases
+ * daily and pulls them down.
  *
- * Source channel: GitHub Releases API. Only `releases/latest` is
- * consulted, which by GitHub's contract excludes drafts and
- * prereleases. So a tag like `v0.2.0-canary` (which we mark
- * prerelease in the release workflow) is invisible here — that's
- * the canary mechanism.
+ * Source channel: the "stable redirect" URL
+ *   github.com/<repo>/releases/latest/download/zs-fleet.zip
+ * which GitHub redirects to the asset of the latest stable release
+ * (prereleases excluded). No GitHub API → no auth → no rate limits.
  *
  * Update layout: each release zip contains
  *
@@ -22,8 +21,14 @@
  *     modules/...
  *   zs-fleet-loader.php      ← NOT touched by self-update
  *
- * The loader stays put forever (1 line of logic, no churn). Any
- * change to the loader requires a manual re-deploy.
+ * The loader stays put forever. Any change to the loader requires
+ * a manual re-deploy.
+ *
+ * Version comparison: download the zip, extract to a temp dir,
+ * parse the `Version:` header from the extracted zs-fleet.php, and
+ * compare with ZS_FLEET_VERSION. If equal-or-older, discard the
+ * temp dir. If newer, atomically rename it into place. ~11KB
+ * download per site per day — bandwidth is irrelevant.
  *
  * Atomic swap: extract to mu-plugins/zs-fleet.new/, rename live
  * away, rename new in place, delete the stash. Brief window where
@@ -42,7 +47,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const ZS_FLEET_AU_REPO        = 'marcorubiol/zs-fleet';
+const ZS_FLEET_AU_ZIP_URL     = 'https://github.com/marcorubiol/zs-fleet/releases/latest/download/zs-fleet.zip';
 const ZS_FLEET_AU_HOOK        = 'zs_fleet_auto_update_check';
 const ZS_FLEET_AU_OPT_LAST    = 'zs_fleet_au_last_check';
 const ZS_FLEET_AU_OPT_SUCCESS = 'zs_fleet_au_last_success';
@@ -79,97 +84,49 @@ function zs_fleet_au_run() {
 	update_option( ZS_FLEET_AU_OPT_LAST, time(), false );
 
 	try {
-		$latest = zs_fleet_au_fetch_latest();
-		if ( is_wp_error( $latest ) ) {
-			zs_fleet_au_log_error( $latest->get_error_message() );
+		$result = zs_fleet_au_check_and_apply();
+		if ( is_wp_error( $result ) ) {
+			zs_fleet_au_log_error( $result->get_error_message() );
 			return;
 		}
-
-		$current = ZS_FLEET_VERSION;
-		$remote  = ltrim( $latest['tag_name'], 'v' );
-
-		if ( version_compare( $remote, $current, '<=' ) ) {
-			// Already current.
+		if ( $result === false ) {
+			// Already current — not an error, not a successful update.
 			return;
 		}
-
-		$zip_url = '';
-		foreach ( (array) ( $latest['assets'] ?? array() ) as $asset ) {
-			if ( ! empty( $asset['name'] ) && substr( $asset['name'], -4 ) === '.zip' ) {
-				$zip_url = $asset['browser_download_url'];
-				break;
-			}
-		}
-		if ( ! $zip_url ) {
-			zs_fleet_au_log_error( 'no zip asset on release ' . $latest['tag_name'] );
-			return;
-		}
-
-		$apply = zs_fleet_au_apply( $zip_url, $remote );
-		if ( is_wp_error( $apply ) ) {
-			zs_fleet_au_log_error( $apply->get_error_message() );
-			return;
-		}
-
+		// $result is the version string we just installed.
 		update_option( ZS_FLEET_AU_OPT_SUCCESS, time(), false );
 		delete_option( ZS_FLEET_AU_OPT_ERROR );
-		error_log( "[zs-fleet] auto-updated v{$current} → v{$remote}" );
+		error_log( '[zs-fleet] auto-updated v' . ZS_FLEET_VERSION . " → v{$result}" );
 	} finally {
 		delete_transient( ZS_FLEET_AU_LOCK );
 	}
 }
 
-function zs_fleet_au_fetch_latest() {
-	$resp = wp_remote_get(
-		'https://api.github.com/repos/' . ZS_FLEET_AU_REPO . '/releases/latest',
-		array(
-			'timeout' => 10,
-			'headers' => array(
-				'Accept'     => 'application/vnd.github+json',
-				'User-Agent' => 'zs-fleet auto-updater (' . home_url() . ')',
-			),
-		)
-	);
-	if ( is_wp_error( $resp ) ) {
-		return $resp;
-	}
-	$code = wp_remote_retrieve_response_code( $resp );
-	if ( $code !== 200 ) {
-		return new WP_Error( 'github_http', "GitHub returned HTTP {$code}" );
-	}
-	$body = json_decode( wp_remote_retrieve_body( $resp ), true );
-	if ( ! is_array( $body ) || empty( $body['tag_name'] ) ) {
-		return new WP_Error( 'github_parse', 'unexpected GitHub response' );
-	}
-	return $body;
-}
-
-function zs_fleet_au_apply( $zip_url, $version ) {
+function zs_fleet_au_check_and_apply() {
 	require_once ABSPATH . 'wp-admin/includes/file.php';
 
-	$tmp_zip  = wp_tempnam( "zs-fleet-{$version}.zip" );
-	$download = wp_remote_get(
-		$zip_url,
+	$tmp_zip = wp_tempnam( 'zs-fleet-check.zip' );
+	$dl      = wp_remote_get(
+		ZS_FLEET_AU_ZIP_URL,
 		array(
-			'timeout'  => 60,
-			'stream'   => true,
-			'filename' => $tmp_zip,
-			'headers'  => array( 'User-Agent' => 'zs-fleet auto-updater' ),
+			'timeout'     => 60,
+			'stream'      => true,
+			'filename'    => $tmp_zip,
+			'redirection' => 5,
+			'headers'     => array( 'User-Agent' => 'zs-fleet auto-updater' ),
 		)
 	);
-	if ( is_wp_error( $download ) ) {
+	if ( is_wp_error( $dl ) ) {
 		@unlink( $tmp_zip );
-		return $download;
+		return $dl;
 	}
-	if ( wp_remote_retrieve_response_code( $download ) !== 200 ) {
+	$code = wp_remote_retrieve_response_code( $dl );
+	if ( $code !== 200 ) {
 		@unlink( $tmp_zip );
-		return new WP_Error( 'download_http', 'zip download failed' );
+		return new WP_Error( 'download_http', "zip download HTTP {$code}" );
 	}
 
-	$tmp_dir = trailingslashit( get_temp_dir() ) . "zs-fleet-extract-{$version}";
-	if ( is_dir( $tmp_dir ) ) {
-		zs_fleet_au_rrmdir( $tmp_dir );
-	}
+	$tmp_dir = trailingslashit( get_temp_dir() ) . 'zs-fleet-check-' . uniqid();
 	if ( ! mkdir( $tmp_dir, 0755, true ) ) {
 		@unlink( $tmp_zip );
 		return new WP_Error( 'mkdir_tmp', 'could not create extraction dir' );
@@ -184,25 +141,32 @@ function zs_fleet_au_apply( $zip_url, $version ) {
 	}
 
 	$extracted = $tmp_dir . '/zs-fleet';
-	if ( ! is_dir( $extracted ) ) {
+	if ( ! is_dir( $extracted ) || ! file_exists( $extracted . '/zs-fleet.php' ) ) {
 		zs_fleet_au_rrmdir( $tmp_dir );
-		return new WP_Error( 'bad_zip', 'zip does not contain zs-fleet/ directory' );
+		return new WP_Error( 'bad_zip', 'extracted zip is malformed' );
 	}
-	if ( ! file_exists( $extracted . '/zs-fleet.php' ) ) {
+
+	$remote_version = zs_fleet_au_read_version( $extracted . '/zs-fleet.php' );
+	if ( ! $remote_version ) {
 		zs_fleet_au_rrmdir( $tmp_dir );
-		return new WP_Error( 'bad_zip', 'extracted zs-fleet/ has no bootstrap' );
+		return new WP_Error( 'bad_zip', 'no Version header in extracted bootstrap' );
+	}
+
+	if ( version_compare( $remote_version, ZS_FLEET_VERSION, '<=' ) ) {
+		// Already current — discard the temp dir, no swap.
+		zs_fleet_au_rrmdir( $tmp_dir );
+		return false;
 	}
 
 	$live  = WPMU_PLUGIN_DIR . '/zs-fleet';
-	$stash = WPMU_PLUGIN_DIR . "/zs-fleet.old-{$version}";
+	$stash = WPMU_PLUGIN_DIR . "/zs-fleet.old-{$remote_version}";
 
-	// Atomic swap.
 	if ( ! @rename( $live, $stash ) ) {
 		zs_fleet_au_rrmdir( $tmp_dir );
 		return new WP_Error( 'swap_stash', 'could not stash live zs-fleet directory' );
 	}
 	if ( ! @rename( $extracted, $live ) ) {
-		// Roll back: put the stash back where it was.
+		// Roll back: put the stash back.
 		@rename( $stash, $live );
 		zs_fleet_au_rrmdir( $tmp_dir );
 		return new WP_Error( 'swap_install', 'could not install new zs-fleet, rolled back' );
@@ -210,7 +174,18 @@ function zs_fleet_au_apply( $zip_url, $version ) {
 	zs_fleet_au_rrmdir( $stash );
 	zs_fleet_au_rrmdir( $tmp_dir );
 
-	return true;
+	return $remote_version;
+}
+
+function zs_fleet_au_read_version( $bootstrap_path ) {
+	$contents = @file_get_contents( $bootstrap_path, false, null, 0, 2048 );
+	if ( ! $contents ) {
+		return '';
+	}
+	if ( preg_match( '/^\s*\*\s*Version:\s*(\S+)/m', $contents, $m ) ) {
+		return $m[1];
+	}
+	return '';
 }
 
 function zs_fleet_au_log_error( $msg ) {

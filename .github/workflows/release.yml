@@ -26,18 +26,23 @@ jobs:
 
       - name: Build release zip
         run: |
+          # Stable asset name (no version suffix): the auto-updater
+          # and self-bootstrap loader fetch it from
+          #   github.com/<repo>/releases/latest/download/zs-fleet.zip
+          # which redirects to the latest stable release without
+          # touching the GitHub API (no rate limits).
           mkdir -p dist/zs-fleet
           cp zs-fleet.php dist/zs-fleet/
           cp -r modules dist/zs-fleet/
           cp deploy/zs-fleet-loader.php dist/
           cp README.md dist/zs-fleet/
           cd dist
-          zip -r "zs-fleet-${GITHUB_REF_NAME}.zip" zs-fleet zs-fleet-loader.php
+          zip -r "zs-fleet.zip" zs-fleet zs-fleet-loader.php
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/zs-fleet-*.zip
+          files: dist/zs-fleet.zip
           generate_release_notes: true
           # Tags with a hyphen suffix (v0.2.0-canary, v0.2.0-rc1) are
           # published as prereleases. The auto-updater queries

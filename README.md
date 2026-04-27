@@ -74,21 +74,32 @@ if ordering matters.
 
 ## Deployment to a site
 
-First-time install (manual via panel or SFTP):
+The loader is self-bootstrapping. First-install reduces to:
+
+1. Drop `deploy/zs-fleet-loader.php` into the site's
+   `wp-content/mu-plugins/` directory (panel, SFTP, whatever).
+2. Visit the site once.
+
+On the first request after install the loader sees that `zs-fleet/`
+is missing, downloads the latest release zip from
+`github.com/marcorubiol/zs-fleet/releases/latest/download/zs-fleet.zip`,
+extracts it into `mu-plugins/zs-fleet/`, and is fully active on the
+next request. After that, the `auto-update` module inside the
+extracted code keeps the site current daily.
+
+Manual bulk install (skip the self-bootstrap, useful when
+downloading the zip locally to push via tooling):
 
 ```bash
-# 1. Get a release zip (or git clone)
-gh release download v0.1.4 --repo marcorubiol/zs-fleet
-
-# 2. Upload to mu-plugins/
-scp deploy/zs-fleet-loader.php  site:/path/to/wp-content/mu-plugins/
+gh release download --repo marcorubiol/zs-fleet --pattern 'zs-fleet.zip'
+unzip zs-fleet.zip
+# now you have zs-fleet/ + zs-fleet-loader.php side by side
 scp -r zs-fleet/                site:/path/to/wp-content/mu-plugins/
+scp    zs-fleet-loader.php      site:/path/to/wp-content/mu-plugins/
 ```
 
-After first install: nothing to do. `auto-update` runs daily via
-WP_Cron, pulls new GitHub releases, swaps the directory atomically.
-
-To force an update right now (e.g. just published a fix):
+To force an update right now (e.g. just published a fix and don't
+want to wait the daily cron):
 
 ```bash
 ssh site 'wp --path=/path/to/wp cron event run zs_fleet_auto_update_check'
