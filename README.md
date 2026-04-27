@@ -109,3 +109,10 @@ complete and the module set is settled. Bumps follow semver:
 - **Major** — breaking layout change (loader path, directory rename).
 - **Minor** — new module added.
 - **Patch** — fix or behaviour tweak inside an existing module.
+
+Release checklist (do not skip — header and tag must match):
+
+1. Bump `Version:` in `zs-fleet.php` header AND `ZS_FLEET_VERSION` constant.
+2. Bump `Version:` in `deploy/zs-fleet-loader.php` header.
+3. Commit with message `release: vX.Y.Z`.
+4. Tag `vX.Y.Z` and push tag — the GitHub Action builds the zip.

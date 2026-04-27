@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Zerø Fleet Loader
  * Description: Bridges WP's flat MU-plugin discovery to the zs-fleet/ subdirectory. Place this file in wp-content/mu-plugins/ alongside the zs-fleet/ directory.
- * Version:     0.1.0
+ * Version:     0.1.3
  * Author:      Zerø System
  * License:     GPL-2.0-or-later
  *
