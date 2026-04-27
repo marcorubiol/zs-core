@@ -32,6 +32,34 @@ file at top level `require_once`s the bootstrap inside the directory.
 | `no-admin-mods`     | Blocks plugin/theme/core install/update/delete from wp-admin browser. Whitelisted operator emails, MainWP Child, WP-CLI and WP-Cron continue to work. |
 | `disable-xmlrpc`    | Disables XML-RPC site-wide (xmlrpc_enabled false + empty methods array + no RSD link + no X-Pingback header). |
 
+## Per-site opt-out
+
+Each module exposes a filter that lets a single site turn it off
+without disabling zs-fleet across the fleet. Filter name pattern:
+
+```
+zs_fleet_<module-slug>_enabled   (default: true)
+```
+
+The check happens inside the module's hooks, so the filter callback
+can be added from a regular plugin (e.g. the site's `zs_<slug>`) and
+it will fire in time. To disable a module at one site, drop this in
+the site's per-site plugin or in `wp-config.php`:
+
+```php
+add_filter( 'zs_fleet_disable_xmlrpc_enabled', '__return_false' );
+```
+
+Currently exposed flags:
+
+| Module            | Filter                                |
+|-------------------|---------------------------------------|
+| `disable-xmlrpc`  | `zs_fleet_disable_xmlrpc_enabled`     |
+
+When you add a new module, follow the same pattern: gate every hook
+on `apply_filters('zs_fleet_<slug>_enabled', true)` returning truthy,
+and add a row to the table above.
+
 ## Adding a module
 
 1. Drop a `*.php` file in `modules/`. It must NOT carry a plugin header

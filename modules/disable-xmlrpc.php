@@ -48,11 +48,21 @@
  *   - Mobile WordPress app uses XML-RPC and will stop working. Not
  *     used by the agency operator.
  *
- * To carve out an exception per-site
- * ----------------------------------
- * Drop a sibling module zz-allow-xmlrpc.php that runs late and
- * remove_action()s the kill switch:
- *   remove_action('plugins_loaded', 'zs_disable_xmlrpc_kill', 1);
+ * To carve out an exception per-site (opt-out)
+ * --------------------------------------------
+ * In wp-config.php (above the "stop editing" line) or in the site's
+ * zs_<slug> plugin, return false from this filter:
+ *
+ *   add_filter( 'zs_fleet_disable_xmlrpc_enabled', '__return_false' );
+ *
+ * The filter is checked at module-load time (mu-plugins fire before
+ * wp-config-loaded? no — see comment in zs-fleet.php). Practically:
+ * MU-plugins load AFTER wp-config.php is parsed but BEFORE regular
+ * plugins. So a wp-config-defined filter callback works; a
+ * regular-plugin-defined one is too late for module-level checks
+ * but fine for action/filter hooks defined inside modules. We use
+ * action/filter hooks here, so a zs_<slug> regular-plugin filter
+ * works correctly.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -65,8 +75,13 @@ if ( ! defined( 'ABSPATH' ) ) {
  * instantiated by xmlrpc.php (which only happens after all plugins
  * are loaded), late enough that WP is bootstrapped enough for
  * status_header() and wp_die() to work cleanly.
+ *
+ * Per-site opt-out: filter `zs_fleet_disable_xmlrpc_enabled` to false.
  */
 function zs_disable_xmlrpc_kill() {
+	if ( ! apply_filters( 'zs_fleet_disable_xmlrpc_enabled', true ) ) {
+		return;
+	}
 	if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
 		status_header( 403 );
 		nocache_headers();
@@ -78,17 +93,34 @@ function zs_disable_xmlrpc_kill() {
 add_action( 'plugins_loaded', 'zs_disable_xmlrpc_kill', 1 );
 
 // Belt-and-braces below — should never matter once kill above fires,
-// but cheap defense-in-depth in case of future WP changes.
+// but cheap defense-in-depth in case of future WP changes. Each one
+// also respects the opt-out filter so a Jetpack site stays consistent.
 
-add_filter( 'xmlrpc_enabled', '__return_false' );
+add_filter( 'xmlrpc_enabled', function ( $enabled ) {
+	if ( ! apply_filters( 'zs_fleet_disable_xmlrpc_enabled', true ) ) {
+		return $enabled;
+	}
+	return false;
+} );
 
-add_filter( 'xmlrpc_methods', function () {
+add_filter( 'xmlrpc_methods', function ( $methods ) {
+	if ( ! apply_filters( 'zs_fleet_disable_xmlrpc_enabled', true ) ) {
+		return $methods;
+	}
 	return array();
 }, 999 );
 
-remove_action( 'wp_head', 'rsd_link' );
+add_action( 'init', function () {
+	if ( ! apply_filters( 'zs_fleet_disable_xmlrpc_enabled', true ) ) {
+		return;
+	}
+	remove_action( 'wp_head', 'rsd_link' );
+} );
 
 add_filter( 'wp_headers', function ( $headers ) {
+	if ( ! apply_filters( 'zs_fleet_disable_xmlrpc_enabled', true ) ) {
+		return $headers;
+	}
 	if ( isset( $headers['X-Pingback'] ) ) {
 		unset( $headers['X-Pingback'] );
 	}
