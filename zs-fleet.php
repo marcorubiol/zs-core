@@ -1,9 +1,10 @@
 <?php
 /**
- * Plugin Name: Zerø Fleet
+ * Plugin Name: ZS Core
  * Description: Modular MU-plugin that bundles fleet-wide hardening and policy modules. Each file in modules/ is auto-loaded.
  * Version:     0.1.8
- * Author:      Zerø System
+ * Author:      Zerø Sense
+ * Author URI:  https://zerosense.studio
  * License:     GPL-2.0-or-later
  *
  * This file is the bootstrap. It does NOT live directly in

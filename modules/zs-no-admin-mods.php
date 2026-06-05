@@ -3,7 +3,8 @@
  * Plugin Name:  Zerø — No Admin Mods
  * Description:  Fleet hardening. (1) Blocks plugin/theme/core modifications from the wp-admin browser UI — whitelisted operator emails, MainWP Child, WP-CLI and WP-Cron stay exempt. (2) Hard-disables XML-RPC (top brute-force / pingback-amplification vector and LSPHP-worker hog). No fleet site uses xmlrpc — MainWP Child talks over its own signed protocol, not xmlrpc.
  * Version:      1.2.0
- * Author:       Zerø System
+ * Author:       Zerø Sense
+ * Author URI:   https://zerosense.studio
  * License:      GPL-2.0-or-later
  *
  * Drop this file into wp-content/mu-plugins/ on each site. Must-Use plugins
