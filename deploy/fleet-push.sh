@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# ⚠ DEPRECATED (2026-06-05) — the Cloudflare/8G WAF 403s the HTTP trigger
+# (?zs_fleet_check_now=1) before it reaches WP, so this does NOT work behind
+# the edge. Use `zs-maintenance au-push` (fleet-toolkit) instead: it fires the
+# SAME auto-update hook server-side via SSH + wp-cron, bypassing the edge.
+# Kept for reference only.
+#
 # fleet-push.sh — fan out an on-demand auto-update check to every
 # zs-fleet site listed in fleet.txt.
 #
