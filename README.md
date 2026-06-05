@@ -18,8 +18,8 @@ wp-content/mu-plugins/
 └── zs-fleet/               ← contents of this repo
     ├── zs-fleet.php        ← bootstrap (header + glob('modules/*.php'))
     └── modules/
-        ├── no-admin-mods.php
-        └── disable-xmlrpc.php
+        ├── zs-no-admin-mods.php  ← hardening: admin-mods block + XML-RPC lockdown + auto-update OFF (v1.2.0)
+        └── auto-update.php       ← self-update from GitHub releases
 ```
 
 WordPress only scans top-level `*.php` in `mu-plugins/`, so the loader
