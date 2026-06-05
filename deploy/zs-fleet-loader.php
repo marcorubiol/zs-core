@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Zerø Fleet Loader
  * Description: Self-bootstrapping loader. On first request, if zs-fleet/ is missing, fetches the latest release from GitHub and installs it. Thereafter acts as the flat-to-subdirectory bridge.
- * Version:     0.1.6
+ * Version:     0.1.7
  * Author:      Zerø System
  * License:     GPL-2.0-or-later
  *
@@ -37,7 +37,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const ZS_FLEET_LOADER_ZIP_URL = 'https://github.com/marcorubiol/zs-fleet/releases/latest/download/zs-fleet.zip';
+const ZS_FLEET_LOADER_ZIP_URL = 'https://github.com/marcorubiol/zs-core/releases/latest/download/zs-fleet.zip';
 
 $zs_fleet_bootstrap = __DIR__ . '/zs-fleet/zs-fleet.php';
 if ( file_exists( $zs_fleet_bootstrap ) ) {

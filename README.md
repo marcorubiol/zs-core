@@ -82,7 +82,7 @@ The loader is self-bootstrapping. First-install reduces to:
 
 On the first request after install the loader sees that `zs-fleet/`
 is missing, downloads the latest release zip from
-`github.com/marcorubiol/zs-fleet/releases/latest/download/zs-fleet.zip`,
+`github.com/marcorubiol/zs-core/releases/latest/download/zs-fleet.zip`,
 extracts it into `mu-plugins/zs-fleet/`, and is fully active on the
 next request. After that, the `auto-update` module inside the
 extracted code keeps the site current daily.

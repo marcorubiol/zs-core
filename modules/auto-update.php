@@ -47,7 +47,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-const ZS_FLEET_AU_ZIP_URL     = 'https://github.com/marcorubiol/zs-fleet/releases/latest/download/zs-fleet.zip';
+const ZS_FLEET_AU_ZIP_URL     = 'https://github.com/marcorubiol/zs-core/releases/latest/download/zs-fleet.zip';
 const ZS_FLEET_AU_HOOK        = 'zs_fleet_auto_update_check';
 const ZS_FLEET_AU_OPT_LAST    = 'zs_fleet_au_last_check';
 const ZS_FLEET_AU_OPT_SUCCESS = 'zs_fleet_au_last_success';

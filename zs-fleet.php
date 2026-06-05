@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Zerø Fleet
  * Description: Modular MU-plugin that bundles fleet-wide hardening and policy modules. Each file in modules/ is auto-loaded.
- * Version:     0.1.6
+ * Version:     0.1.7
  * Author:      Zerø System
  * License:     GPL-2.0-or-later
  *
