@@ -95,6 +95,16 @@ $t['updates'][0]['type'] = 'core';
 check( zs_fleet_ue_validate_shape( $t ) !== '', 'unsupported type (core) rejected' );
 
 $t = $good;
+$t['updates'][0]['type'] = 'theme';
+$t['updates'][0]['slug'] = 'bricks';
+check( zs_fleet_ue_validate_shape( $t ) === '', 'theme type accepted' );
+
+$t = $good;
+$t['updates'][0]['type'] = 'theme';
+$t['updates'][0]['slug'] = '.';
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'theme with unsafe slug rejected' );
+
+$t = $good;
 $t['manifest_version'] = 2;
 check( zs_fleet_ue_validate_shape( $t ) !== '', 'future manifest_version rejected' );
 

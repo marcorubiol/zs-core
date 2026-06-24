@@ -132,8 +132,8 @@ function zs_fleet_ue_validate_shape( $m ) {
 		if ( ! zs_fleet_ue_safe_slug( $u['slug'] ) ) {
 			return "update[{$i}] unsafe slug: {$u['slug']}";
 		}
-		if ( ! in_array( $u['type'], array( 'plugin' ), true ) ) {
-			// v2 step 1 handles plugins only. theme/core come later, gated.
+		if ( ! in_array( $u['type'], array( 'plugin', 'theme' ), true ) ) {
+			// plugins + themes supported. core comes later, gated.
 			return "update[{$i}] unsupported type: {$u['type']}";
 		}
 	}
@@ -336,13 +336,16 @@ function zs_fleet_ue_safe_slug( $slug ) {
  * Defense-in-depth backstop behind zs_fleet_ue_safe_slug, so even a bad slug
  * that somehow slipped shape validation can never operate on the plugins root.
  */
-function zs_fleet_ue_live_path( $slug ) {
+function zs_fleet_ue_live_path( $slug, $base = null ) {
 	if ( ! zs_fleet_ue_safe_slug( $slug ) ) {
 		return new WP_Error( 'unsafe_slug', "unsafe slug: {$slug}" );
 	}
-	$root = realpath( WP_PLUGIN_DIR );
+	if ( $base === null ) {
+		$base = WP_PLUGIN_DIR;
+	}
+	$root = realpath( $base );
 	if ( $root === false ) {
-		return new WP_Error( 'no_plugin_dir', 'WP_PLUGIN_DIR not resolvable' );
+		return new WP_Error( 'no_base_dir', 'base dir not resolvable: ' . $base );
 	}
 	$live  = $root . DIRECTORY_SEPARATOR . $slug;
 	$rlive = realpath( $live ); // may be false if the target does not exist yet (restore).
@@ -368,17 +371,17 @@ function zs_fleet_ue_stash_base() {
  *
  * @return string|WP_Error absolute stash path of the copied dir.
  */
-function zs_fleet_ue_stash_plugin( $slug, $version ) {
+function zs_fleet_ue_stash_plugin( $slug, $version, $source_base = null ) {
 	$base = zs_fleet_ue_stash_base();
 	if ( is_wp_error( $base ) ) {
 		return $base;
 	}
-	$live = zs_fleet_ue_live_path( $slug );
+	$live = zs_fleet_ue_live_path( $slug, $source_base );
 	if ( is_wp_error( $live ) ) {
 		return $live;
 	}
 	if ( ! is_dir( $live ) ) {
-		return new WP_Error( 'stash_no_live', "live plugin dir missing: {$live}" );
+		return new WP_Error( 'stash_no_live', "live dir missing: {$live}" );
 	}
 	$safe_ver = preg_replace( '/[^A-Za-z0-9._-]/', '_', (string) $version );
 	$stash    = trailingslashit( $base ) . $slug . '-' . $safe_ver . '-' . time();
@@ -411,11 +414,11 @@ function zs_fleet_ue_stash_plugin( $slug, $version ) {
  * The stash itself is never consumed — it survives as a record; the pruner cleans
  * it up later.
  */
-function zs_fleet_ue_restore_plugin( $slug, $stash ) {
+function zs_fleet_ue_restore_plugin( $slug, $stash, $source_base = null ) {
 	if ( ! is_dir( $stash ) ) {
 		return false; // stash missing — caller treats as unrecoverable.
 	}
-	$live = zs_fleet_ue_live_path( $slug );
+	$live = zs_fleet_ue_live_path( $slug, $source_base );
 	if ( is_wp_error( $live ) ) {
 		return false;
 	}
@@ -423,7 +426,11 @@ function zs_fleet_ue_restore_plugin( $slug, $stash ) {
 	WP_Filesystem();
 	global $wp_filesystem;
 
-	$tmp = $live . '.zs-new';
+	// Dot-prefix the scratch dirs so WP enumeration ignores them: a theme restore
+	// puts these in the themes root, and search_theme_directories() registers any
+	// non-dot subdir with a style.css as a phantom theme. '.bricks.zs-new' is skipped.
+	$scratch = dirname( $live ) . '/.' . basename( $live );
+	$tmp     = $scratch . '.zs-new';
 	if ( is_dir( $tmp ) ) {
 		$wp_filesystem->delete( $tmp, true );
 	}
@@ -440,7 +447,7 @@ function zs_fleet_ue_restore_plugin( $slug, $stash ) {
 
 	// Swap by rename. Move the (broken) live aside first so we can put it back
 	// if the second rename fails — live is never left missing.
-	$broken = $live . '.zs-broken-' . time();
+	$broken = $scratch . '.zs-broken-' . time();
 	if ( is_dir( $live ) && ! $wp_filesystem->move( $live, $broken, true ) ) {
 		zs_fleet_ue_rrmdir( $tmp );
 		return false;
@@ -706,6 +713,160 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * THEMES — parallel path. An active theme cannot be cleanly "deactivated" like
+ * a plugin, so the file-level stash/restore (not deactivation) IS the only
+ * safety net — which is why restore correctness matters even more here. Reuses
+ * the generalized stash/restore (base = themes dir), http/fingerprint, prune.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Apply a single THEME update. Mirrors apply_one but via Theme_Upgrader + themes dir. */
+function zs_fleet_ue_apply_one_theme( $update, $mode ) {
+	$slug = $update['slug'];
+	$from = (string) $update['from'];
+	$to   = (string) $update['to'];
+
+	$row = array(
+		'type'           => 'theme',
+		'slug'           => $slug,
+		'from'           => $from,
+		'to'             => $to,
+		'outcome'        => 'error',
+		'version_before' => '',
+		'version_after'  => '',
+		'active_before'  => null,
+		'active_after'   => null,
+		'http_after'     => null,
+		'http_time_s'    => null,
+		'fingerprint_ok' => null,
+		'stash'          => '',
+		'message'        => '',
+	);
+
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/misc.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	require_once ABSPATH . 'wp-admin/includes/theme.php';
+
+	$theme = wp_get_theme( $slug );
+	if ( ! $theme->exists() ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'theme not installed';
+		return $row;
+	}
+	$themes_dir = get_theme_root( $slug );
+
+	$ver_before            = (string) $theme->get( 'Version' );
+	$row['version_before'] = $ver_before;
+	$row['version_after']  = $ver_before;
+	// "active" for a theme = it is the active stylesheet OR the parent template.
+	$active_before         = ( get_stylesheet() === $slug || get_template() === $slug );
+	$row['active_before']  = $active_before;
+
+	if ( $ver_before === $to ) {
+		$row['outcome'] = 'noop';
+		$row['message'] = 'already at target version';
+		return $row;
+	}
+	if ( $from !== '' && $ver_before !== $from ) {
+		$row['outcome'] = 'drift';
+		$row['message'] = "on-disk {$ver_before} != manifest from {$from}";
+		return $row;
+	}
+
+	// Refresh the theme transient WITH themes loaded (no --skip-themes) so premium
+	// theme updaters (Bricks/Etch) register on-site — the Path-C-for-themes case.
+	delete_site_transient( 'update_themes' );
+	wp_update_themes();
+	$t = get_site_transient( 'update_themes' );
+	if ( empty( $t->response[ $slug ] ) ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'no pending theme update visible on-site (premium-detection gate?)';
+		return $row;
+	}
+
+	if ( $mode === 'shadow' ) {
+		$row['outcome'] = 'applied';
+		$row['message'] = 'shadow: would apply theme ' . $from . ' → ' . $to;
+		return $row;
+	}
+
+	// ── APPLY (stash-first, like plugins; base = themes dir) ──
+	$stash = zs_fleet_ue_stash_plugin( $slug, $ver_before, $themes_dir );
+	if ( is_wp_error( $stash ) ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'stash failed, not applied: ' . $stash->get_error_message();
+		return $row;
+	}
+	$row['stash'] = str_replace( trailingslashit( WP_CONTENT_DIR ), '', $stash );
+
+	WP_Filesystem();
+	$upgrader = new Theme_Upgrader( new Automatic_Upgrader_Skin() );
+	$result   = $upgrader->upgrade( $slug );
+
+	if ( is_wp_error( $result ) || $result === false ) {
+		$row['message'] .= 'theme upgrade ' . ( is_wp_error( $result ) ? 'error: ' . $result->get_error_message() : 'returned false' ) . '. ';
+		zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme upgrade fail →' );
+		return $row;
+	}
+
+	wp_clean_themes_cache( false );
+	$ver_after                  = (string) wp_get_theme( $slug )->get( 'Version' );
+	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
+	$fp_ok                      = zs_fleet_ue_fingerprint_ok( $body );
+	$row['version_after']  = $ver_after;
+	$row['active_after']   = ( get_stylesheet() === $slug || get_template() === $slug );
+	$row['http_after']     = $code;
+	$row['http_time_s']    = $secs;
+	$row['fingerprint_ok'] = $fp_ok;
+
+	if ( $ver_after === $to && $code === 200 && $fp_ok ) {
+		$row['outcome'] = 'applied';
+		zs_fleet_ue_prune_stashes( $slug );
+		return $row;
+	}
+	zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme verify failed →' );
+	return $row;
+}
+
+/** Theme rollback: restore stash → re-verify health → rolled_back only if confirmed. No reactivation. */
+function zs_fleet_ue_rollback_theme( &$row, $slug, $stash, $from, $themes_dir, $reason ) {
+	if ( ! is_string( $stash ) || $stash === '' || ! is_dir( $stash ) ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= $reason . ' CRITICAL: no rollback (stash missing).';
+		zs_fleet_ue_breadcrumb( $slug, 'theme_stash_missing', $row );
+		error_log( '[zs-fleet] CRITICAL theme no_stash for ' . $slug . ' at ' . home_url() );
+		return;
+	}
+	if ( ! zs_fleet_ue_restore_plugin( $slug, $stash, $themes_dir ) ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= $reason . ' CRITICAL: theme restore failed — site may be degraded.';
+		zs_fleet_ue_breadcrumb( $slug, 'theme_restore_failed', $row );
+		error_log( '[zs-fleet] CRITICAL theme restore_failed for ' . $slug . ' at ' . home_url() );
+		return;
+	}
+	wp_clean_themes_cache( false );
+	$ver_after                  = (string) wp_get_theme( $slug )->get( 'Version' );
+	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
+	$fp_ok                      = zs_fleet_ue_fingerprint_ok( $body );
+	$row['version_after']  = $ver_after;
+	$row['active_after']   = ( get_stylesheet() === $slug || get_template() === $slug );
+	$row['http_after']     = $code;
+	$row['http_time_s']    = $secs;
+	$row['fingerprint_ok'] = $fp_ok;
+
+	$healthy = ( $code === 200 ) && $fp_ok && ( $ver_after === (string) $from );
+	if ( $healthy ) {
+		$row['outcome']  = 'rolled_back';
+		$row['message'] .= $reason . ' restored to ' . $ver_after . ' (verified healthy).';
+		return;
+	}
+	$row['outcome']  = 'error';
+	$row['message'] .= $reason . ' CRITICAL: theme restore ran but site still degraded (http ' . $code . ', ver ' . $ver_after . ').';
+	zs_fleet_ue_breadcrumb( $slug, 'theme_restore_left_degraded', $row );
+	error_log( '[zs-fleet] CRITICAL theme restore_left_degraded for ' . $slug . ' at ' . home_url() );
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * RUN
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -717,7 +878,9 @@ function zs_fleet_ue_run( $manifest ) {
 	$mode    = $manifest['mode'];
 	$results = array();
 	foreach ( $manifest['updates'] as $update ) {
-		$results[] = zs_fleet_ue_apply_one( $update, $mode );
+		$results[] = ( isset( $update['type'] ) && $update['type'] === 'theme' )
+			? zs_fleet_ue_apply_one_theme( $update, $mode )
+			: zs_fleet_ue_apply_one( $update, $mode );
 	}
 	list( $code, $secs ) = zs_fleet_ue_http_self();
 	return array(
