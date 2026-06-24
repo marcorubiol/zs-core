@@ -14,6 +14,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Setup PHP (with sodium for the engine signature tests)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: sodium
+
       - name: PHP syntax check
         run: |
           # Lint every PHP file shipped to fleet sites. A syntax error
@@ -23,6 +29,14 @@ jobs:
           set -e
           find zs-fleet.php modules deploy -name '*.php' -print0 \
             | xargs -0 -n1 php -l
+
+      - name: Engine tests (hard gate — the update engine cannot ship broken)
+        run: |
+          # Pure logic + Ed25519 signature verification, and the stateful
+          # stash/restore core against real dirs (byte-identical restore).
+          set -e
+          php tests/test-engine-pure.php
+          php tests/test-stash-restore.php
 
       - name: Build release zip
         run: |
