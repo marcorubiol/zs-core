@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ZS Core
  * Description: Self-bootstrapping loader. On first request, if zs-fleet/ is missing, fetches the latest release from GitHub and installs it. Thereafter acts as the flat-to-subdirectory bridge.
- * Version:     0.1.8
+ * Version:     0.2.0
  * Author:      Zerø Sense
  * Author URI:  https://zerosense.studio
  * License:     GPL-2.0-or-later
