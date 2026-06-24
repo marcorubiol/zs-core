@@ -45,12 +45,14 @@ if ( ! defined( 'ABSPATH' ) ) {
 /* ── Config (all overridable via wp-config.php constants) ─────────────────── */
 
 if ( ! defined( 'ZS_FLEET_UE_PUBKEY' ) ) {
-	// base64 Ed25519 public key. Empty until step 3 keygen → engine stays inert.
-	define( 'ZS_FLEET_UE_PUBKEY', '' );
+	// base64 raw Ed25519 public key of the fleet control-plane. Fleet-wide; the
+	// matching private key lives only in the Worker (fleet-control). A wrong/empty
+	// key just makes every manifest fail verification — fail-safe.
+	define( 'ZS_FLEET_UE_PUBKEY', '01Wl/1uROuecwc2i8QERW+hKJQfiDGHKx54qTWAraOg=' );
 }
 if ( ! defined( 'ZS_FLEET_UE_CONTROL_URL' ) ) {
-	// Control-plane base URL (no trailing slash). Empty → no remote pull.
-	define( 'ZS_FLEET_UE_CONTROL_URL', '' );
+	// Control-plane base URL (no trailing slash). Fleet-wide endpoint.
+	define( 'ZS_FLEET_UE_CONTROL_URL', 'https://fleet-control.marco-rubiol.workers.dev' );
 }
 if ( ! defined( 'ZS_FLEET_UE_SITE_TOKEN' ) ) {
 	// Per-site check-in token, issued by the control-plane at enrollment. Empty → inert.
