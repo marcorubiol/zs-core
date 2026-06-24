@@ -89,14 +89,16 @@ function zs_fleet_ue_canonical_json( $data ) {
 		ksort( $data );
 		$parts = array();
 		foreach ( $data as $k => $v ) {
-			$parts[] = json_encode( (string) $k ) . ':' . zs_fleet_ue_canonical_json( $v );
+			$parts[] = json_encode( (string) $k, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE ) . ':' . zs_fleet_ue_canonical_json( $v );
 		}
 		return '{' . implode( ',', $parts ) . '}';
 	}
 	if ( is_bool( $data ) || is_int( $data ) || is_float( $data ) || is_null( $data ) ) {
-		return json_encode( $data );
+		return json_encode( $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
 	}
-	return json_encode( (string) $data );
+	// UNESCAPED slashes + unicode so the canonical bytes match a JS
+	// JSON.stringify-based serializer (the control-plane Worker, which signs).
+	return json_encode( (string) $data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE );
 }
 
 /**
