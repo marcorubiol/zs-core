@@ -179,5 +179,21 @@ check( zs_fleet_ue_verify_envelope( $env_bad, $pk_b64 ) instanceof WP_Error, 'ma
 
 check( zs_fleet_ue_verify_envelope( array( 'payload' => 'x' ), $pk_b64 ) instanceof WP_Error, 'envelope missing signature rejected' );
 
+/* ── detect → pending shaping (pure over a detect array) ─────────────────── */
+$detect = array(
+	'plugins' => array(
+		array( 'slug' => 'foo', 'current' => '1.0', 'active' => true, 'available' => '1.1' ),
+		array( 'slug' => 'bar', 'current' => '2.0', 'active' => false ), // no available → not pending
+	),
+	'themes'  => array(
+		array( 'slug' => 'bricks', 'current' => '2.3.7', 'active' => true, 'available' => '2.3.8' ),
+	),
+);
+$pending = zs_fleet_ue_pending( $detect );
+check( count( $pending ) === 2, 'pending extracts only updatable items' );
+check( $pending[0]['type'] === 'plugin' && $pending[0]['slug'] === 'foo' && $pending[0]['from'] === '1.0' && $pending[0]['to'] === '1.1', 'pending plugin shape (type/slug/from/to)' );
+check( $pending[1]['type'] === 'theme' && $pending[1]['slug'] === 'bricks' && $pending[1]['to'] === '2.3.8', 'pending theme shape' );
+check( zs_fleet_ue_pending( array() ) === array(), 'pending handles empty detect' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );

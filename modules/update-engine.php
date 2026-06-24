@@ -946,6 +946,100 @@ function zs_fleet_ue_consume_nonce( $nonce ) {
 	update_option( ZS_FLEET_UE_OPT_NONCES, $list, false );
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * DETECTION / INVENTORY — the check-in payload the control-plane consumes.
+ *
+ * Reports installed plugins + themes (current version, active state, and the
+ * available version when an update is visible), plus an honest `admin_context`
+ * flag. Some plugins register their custom updater ONLY when is_admin() was true
+ * AT LOAD time, so a check run outside admin context undercounts them (validated
+ * 2026-06-24: must-have-cookie invisible in plain cli, visible with WP_ADMIN
+ * defined before boot). The CALLER provides admin context — e.g.
+ *   wp --exec='if(!defined("WP_ADMIN"))define("WP_ADMIN",true);' eval 'echo json_encode(zs_fleet_ue_detect());'
+ * detect() cannot retroactively change is_admin() for already-loaded plugins; it
+ * surfaces the flag so the control-plane knows whether the report is complete.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+function zs_fleet_ue_detect() {
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/theme.php';
+	require_once ABSPATH . 'wp-admin/includes/update.php';
+
+	delete_site_transient( 'update_plugins' );
+	wp_update_plugins();
+	delete_site_transient( 'update_themes' );
+	wp_update_themes();
+	$tp = get_site_transient( 'update_plugins' );
+	$tt = get_site_transient( 'update_themes' );
+
+	$plugins = array();
+	foreach ( get_plugins() as $file => $data ) {
+		$slug = dirname( $file );
+		if ( $slug === '.' ) {
+			continue; // root single-file plugins are out of scope for the engine.
+		}
+		$row = array(
+			'slug'    => $slug,
+			'current' => isset( $data['Version'] ) ? (string) $data['Version'] : '',
+			'active'  => is_plugin_active( $file ),
+		);
+		if ( isset( $tp->response[ $file ]->new_version ) ) {
+			$row['available'] = (string) $tp->response[ $file ]->new_version;
+		}
+		$plugins[] = $row;
+	}
+
+	$themes = array();
+	foreach ( wp_get_themes() as $slug => $theme ) {
+		$row = array(
+			'slug'    => (string) $slug,
+			'current' => (string) $theme->get( 'Version' ),
+			'active'  => ( get_stylesheet() === $slug || get_template() === $slug ),
+		);
+		if ( isset( $tt->response[ $slug ]['new_version'] ) ) {
+			$row['available'] = (string) $tt->response[ $slug ]['new_version'];
+		}
+		$themes[] = $row;
+	}
+
+	return array(
+		'site'           => wp_parse_url( home_url(), PHP_URL_HOST ),
+		'engine_version' => defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : 'unknown',
+		'detected_at'    => gmdate( 'c' ),
+		'admin_context'  => is_admin(), // false → may undercount is_admin()-gated updaters.
+		'wp_version'     => get_bloginfo( 'version' ),
+		'php_version'    => PHP_VERSION,
+		'plugins'        => $plugins,
+		'themes'         => $themes,
+	);
+}
+
+/**
+ * Convenience (pure over a detect array): just the updatable items, shaped like
+ * manifest update entries (type/slug/from/to) so the orchestrator can turn the
+ * report straight into a manifest.
+ */
+function zs_fleet_ue_pending( $detect ) {
+	$out = array();
+	foreach ( array( 'plugins' => 'plugin', 'themes' => 'theme' ) as $key => $type ) {
+		if ( empty( $detect[ $key ] ) || ! is_array( $detect[ $key ] ) ) {
+			continue;
+		}
+		foreach ( $detect[ $key ] as $row ) {
+			if ( isset( $row['available'] ) ) {
+				$out[] = array(
+					'type'   => $type,
+					'slug'   => $row['slug'],
+					'from'   => $row['current'],
+					'to'     => $row['available'],
+					'active' => ! empty( $row['active'] ),
+				);
+			}
+		}
+	}
+	return $out;
+}
+
 /* ── Remote pull (egress) + cron ────────────────────────────────────────── */
 
 /** Pull the current signed manifest envelope from the control-plane. */
