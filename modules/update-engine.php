@@ -66,11 +66,16 @@ const ZS_FLEET_UE_HOOK          = 'zs_fleet_ue_pull';
 const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue_lock';
 const ZS_FLEET_UE_OPT_NONCES    = 'zs_fleet_ue_consumed_nonces'; // replay guard
 const ZS_FLEET_UE_OPT_REPORT    = 'zs_fleet_ue_last_report';
+const ZS_FLEET_UE_OPT_INTERVAL  = 'zs_fleet_ue_interval';        // control-plane-driven check-in cadence (seconds)
+const ZS_FLEET_UE_SCHEDULE      = 'zs_fleet_ue';                 // custom cron schedule name (interval = the option above)
+const ZS_FLEET_UE_INTERVAL_MIN  = 300;                           // 5 min floor
+const ZS_FLEET_UE_INTERVAL_MAX  = 86400;                         // 24 h ceiling
 const ZS_FLEET_UE_STASH_SUBDIR  = 'zs-fleet-stash';             // under wp-content. NOT under upgrade/ — WP_Upgrader::unpack_package() wipes EVERY child of wp-content/upgrade/ on each run, which would delete our rollback copy mid-flight.
 const ZS_FLEET_UE_STASH_KEEP    = 3;                              // retain N stashes/slug
 
 add_action( 'init', 'zs_fleet_ue_schedule' );
 add_action( ZS_FLEET_UE_HOOK, 'zs_fleet_ue_cron_run' );
+add_filter( 'cron_schedules', 'zs_fleet_ue_cron_schedules' );
 
 /* ──────────────────────────────────────────────────────────────────────────
  * PURE LOGIC — no WordPress calls, unit-testable in isolation.
@@ -123,14 +128,19 @@ function zs_fleet_ue_validate_shape( $m ) {
 	if ( (int) $m['manifest_version'] !== 1 ) {
 		return 'unsupported manifest_version';
 	}
-	if ( ! in_array( $m['mode'], array( 'shadow', 'apply' ), true ) ) {
+	if ( ! in_array( $m['mode'], array( 'shadow', 'apply', 'rollback' ), true ) ) {
 		return 'invalid mode';
 	}
 	if ( ! is_array( $m['updates'] ) ) {
 		return 'updates not a list';
 	}
+	// A rollback item is minimal — { type, slug } only; the engine restores the
+	// most recent stash and ignores from/to. Apply/shadow still require from/to.
+	$required = ( $m['mode'] === 'rollback' )
+		? array( 'type', 'slug' )
+		: array( 'type', 'slug', 'from', 'to' );
 	foreach ( $m['updates'] as $i => $u ) {
-		foreach ( array( 'type', 'slug', 'from', 'to' ) as $k ) {
+		foreach ( $required as $k ) {
 			if ( ! isset( $u[ $k ] ) || ! is_string( $u[ $k ] ) || $u[ $k ] === '' ) {
 				return "update[{$i}] missing/invalid: {$k}";
 			}
@@ -510,8 +520,10 @@ function zs_fleet_ue_rollback( &$row, $slug, $pf, $stash, $from, $active_before,
 	$row['http_time_s']    = $secs;
 	$row['fingerprint_ok'] = $fp_ok;
 
+	// $from may be '' in rollback mode (the prior version isn't pinned — the
+	// stash IS the source of truth); only enforce the version match when known.
 	$healthy = ( $code === 200 ) && $fp_ok
-		&& ( (string) $ver_after === (string) $from )
+		&& ( $from === '' || (string) $ver_after === (string) $from )
 		&& ( ! $active_before || $active_after );
 
 	if ( $healthy ) {
@@ -862,7 +874,8 @@ function zs_fleet_ue_rollback_theme( &$row, $slug, $stash, $from, $themes_dir, $
 	$row['http_time_s']    = $secs;
 	$row['fingerprint_ok'] = $fp_ok;
 
-	$healthy = ( $code === 200 ) && $fp_ok && ( $ver_after === (string) $from );
+	// $from may be '' in rollback mode (prior version not pinned — stash is truth).
+	$healthy = ( $code === 200 ) && $fp_ok && ( $from === '' || $ver_after === (string) $from );
 	if ( $healthy ) {
 		$row['outcome']  = 'rolled_back';
 		$row['message'] .= $reason . ' restored to ' . $ver_after . ' (verified healthy).';
@@ -872,6 +885,145 @@ function zs_fleet_ue_rollback_theme( &$row, $slug, $stash, $from, $themes_dir, $
 	$row['message'] .= $reason . ' CRITICAL: theme restore ran but site still degraded (http ' . $code . ', ver ' . $ver_after . ').';
 	zs_fleet_ue_breadcrumb( $slug, 'theme_restore_left_degraded', $row );
 	error_log( '[zs-fleet] CRITICAL theme restore_left_degraded for ' . $slug . ' at ' . home_url() );
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * ROLLBACK MODE — restore the most recent stash for a slug, no upgrader, no
+ * network package fetch. Reuses the same restore + re-verify path as a failed
+ * apply (zs_fleet_ue_rollback / _theme). A rollback item is minimal { type, slug }.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/** Newest stash dir for $slug (by trailing -<timestamp>), or '' if none. */
+function zs_fleet_ue_latest_stash( $slug ) {
+	if ( ! zs_fleet_ue_safe_slug( $slug ) ) {
+		return '';
+	}
+	$base = trailingslashit( WP_CONTENT_DIR ) . ZS_FLEET_UE_STASH_SUBDIR;
+	if ( ! is_dir( $base ) ) {
+		return '';
+	}
+	$dirs = glob( $base . '/' . $slug . '-*', GLOB_ONLYDIR );
+	if ( ! $dirs ) {
+		return '';
+	}
+	// Stash dirs are named '<slug>-<safever>-<timestamp>'. Newest = highest
+	// trailing timestamp (matches zs_fleet_ue_prune_stashes' ordering).
+	usort(
+		$dirs,
+		function ( $a, $b ) {
+			return (int) substr( strrchr( $a, '-' ), 1 ) <=> (int) substr( strrchr( $b, '-' ), 1 );
+		}
+	);
+	return end( $dirs );
+}
+
+/**
+ * Roll a single PLUGIN back to its most recent engine stash. No upgrader, no
+ * network. Reuses zs_fleet_ue_rollback for the restore + health re-verify.
+ * Outcome: 'rolled_back' on a verified-healthy restore, 'skipped' when there is
+ * no stash, 'error' on a failed/degraded restore.
+ */
+function zs_fleet_ue_rollback_one( $update ) {
+	$slug = $update['slug'];
+
+	$row = array(
+		'type'           => 'plugin',
+		'slug'           => $slug,
+		'from'           => '',
+		'to'             => '',
+		'outcome'        => 'error',
+		'version_before' => '',
+		'version_after'  => '',
+		'active_before'  => null,
+		'active_after'   => null,
+		'http_after'     => null,
+		'http_time_s'    => null,
+		'fingerprint_ok' => null,
+		'stash'          => '',
+		'message'        => '',
+	);
+
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+
+	$pf = zs_fleet_ue_resolve_plugin_file( $slug );
+	if ( $pf === '' ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'plugin not installed';
+		return $row;
+	}
+
+	$ver_before            = zs_fleet_ue_disk_version( $pf );
+	$row['version_before'] = $ver_before;
+	$row['version_after']  = $ver_before;
+	$active_before         = is_plugin_active( $pf );
+	$row['active_before']  = $active_before;
+
+	$stash = zs_fleet_ue_latest_stash( $slug );
+	if ( $stash === '' ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'no stash to restore';
+		return $row;
+	}
+	$row['stash'] = str_replace( trailingslashit( WP_CONTENT_DIR ), '', $stash );
+
+	// Restore + re-verify. The stash carries the prior version; $from is left
+	// empty so the rollback's health check does not pin a specific version.
+	zs_fleet_ue_rollback( $row, $slug, $pf, $stash, '', $active_before, 'rollback mode →' );
+	return $row;
+}
+
+/**
+ * Roll a single THEME back to its most recent engine stash. Mirrors
+ * zs_fleet_ue_rollback_one via the theme restore path (themes dir).
+ */
+function zs_fleet_ue_rollback_one_theme( $update ) {
+	$slug = $update['slug'];
+
+	$row = array(
+		'type'           => 'theme',
+		'slug'           => $slug,
+		'from'           => '',
+		'to'             => '',
+		'outcome'        => 'error',
+		'version_before' => '',
+		'version_after'  => '',
+		'active_before'  => null,
+		'active_after'   => null,
+		'http_after'     => null,
+		'http_time_s'    => null,
+		'fingerprint_ok' => null,
+		'stash'          => '',
+		'message'        => '',
+	);
+
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/theme.php';
+
+	$theme = wp_get_theme( $slug );
+	if ( ! $theme->exists() ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'theme not installed';
+		return $row;
+	}
+	$themes_dir = get_theme_root( $slug );
+
+	$ver_before            = (string) $theme->get( 'Version' );
+	$row['version_before'] = $ver_before;
+	$row['version_after']  = $ver_before;
+	$active_before         = ( get_stylesheet() === $slug || get_template() === $slug );
+	$row['active_before']  = $active_before;
+
+	$stash = zs_fleet_ue_latest_stash( $slug );
+	if ( $stash === '' ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'no stash to restore';
+		return $row;
+	}
+	$row['stash'] = str_replace( trailingslashit( WP_CONTENT_DIR ), '', $stash );
+
+	zs_fleet_ue_rollback_theme( $row, $slug, $stash, '', $themes_dir, 'rollback mode →' );
+	return $row;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -886,7 +1038,14 @@ function zs_fleet_ue_run( $manifest ) {
 	$mode    = $manifest['mode'];
 	$results = array();
 	foreach ( $manifest['updates'] as $update ) {
-		$results[] = ( isset( $update['type'] ) && $update['type'] === 'theme' )
+		$is_theme = ( isset( $update['type'] ) && $update['type'] === 'theme' );
+		if ( $mode === 'rollback' ) {
+			$results[] = $is_theme
+				? zs_fleet_ue_rollback_one_theme( $update )
+				: zs_fleet_ue_rollback_one( $update );
+			continue;
+		}
+		$results[] = $is_theme
 			? zs_fleet_ue_apply_one_theme( $update, $mode )
 			: zs_fleet_ue_apply_one( $update, $mode );
 	}
@@ -924,14 +1083,16 @@ function zs_fleet_ue_process_envelope( $envelope ) {
 	if ( ! zs_fleet_ue_not_expired( $manifest['expires_at'], time() ) ) {
 		return new WP_Error( 'expired', 'manifest expired' );
 	}
-	// Replay guard: refuse a consumed nonce (apply mode only — shadow is idempotent).
-	if ( $manifest['mode'] === 'apply' && zs_fleet_ue_nonce_consumed( $manifest['nonce'] ) ) {
+	// Replay guard: refuse a consumed nonce on state-mutating modes (apply +
+	// rollback); shadow is idempotent and exempt.
+	$mutating = in_array( $manifest['mode'], array( 'apply', 'rollback' ), true );
+	if ( $mutating && zs_fleet_ue_nonce_consumed( $manifest['nonce'] ) ) {
 		return new WP_Error( 'replay', 'nonce already consumed' );
 	}
 
 	$report = zs_fleet_ue_run( $manifest );
 
-	if ( $manifest['mode'] === 'apply' ) {
+	if ( $mutating ) {
 		zs_fleet_ue_consume_nonce( $manifest['nonce'] );
 	}
 	update_option( ZS_FLEET_UE_OPT_REPORT, $report, false );
@@ -1096,7 +1257,7 @@ function zs_fleet_ue_checkin( $report = null ) {
 	if ( $report !== null ) {
 		$payload['report'] = $report;
 	}
-	wp_remote_post(
+	$resp = wp_remote_post(
 		trailingslashit( ZS_FLEET_UE_CONTROL_URL ) . 'v1/checkin',
 		array(
 			'timeout' => 20,
@@ -1107,6 +1268,41 @@ function zs_fleet_ue_checkin( $report = null ) {
 			'body'    => wp_json_encode( $payload ),
 		)
 	);
+
+	// Cadence control: honor a `next_checkin_seconds` the control-plane returns,
+	// clamped to [MIN, MAX]. Persist only on a real change so init's reschedule
+	// stays idempotent. The schedule itself is re-applied by zs_fleet_ue_schedule().
+	if ( ! is_wp_error( $resp ) ) {
+		$body = json_decode( (string) wp_remote_retrieve_body( $resp ), true );
+		if ( is_array( $body ) && isset( $body['next_checkin_seconds'] ) && is_int( $body['next_checkin_seconds'] ) ) {
+			$secs = max( ZS_FLEET_UE_INTERVAL_MIN, min( ZS_FLEET_UE_INTERVAL_MAX, $body['next_checkin_seconds'] ) );
+			if ( $secs !== zs_fleet_ue_desired_interval() ) {
+				update_option( ZS_FLEET_UE_OPT_INTERVAL, $secs, false );
+				// Apply immediately so the next pull lands on the new cadence rather
+				// than waiting for the following init.
+				zs_fleet_ue_schedule();
+			}
+		}
+	}
+}
+
+/** Desired check-in interval (seconds): stored option clamped, default 1 h. */
+function zs_fleet_ue_desired_interval() {
+	$secs = (int) get_option( ZS_FLEET_UE_OPT_INTERVAL, 0 );
+	if ( $secs <= 0 ) {
+		return HOUR_IN_SECONDS;
+	}
+	return max( ZS_FLEET_UE_INTERVAL_MIN, min( ZS_FLEET_UE_INTERVAL_MAX, $secs ) );
+}
+
+/** Register the custom 'zs_fleet_ue' cron schedule with the desired interval. */
+function zs_fleet_ue_cron_schedules( $schedules ) {
+	$secs = zs_fleet_ue_desired_interval();
+	$schedules[ ZS_FLEET_UE_SCHEDULE ] = array(
+		'interval' => $secs,
+		'display'  => 'ZS Fleet check-in (' . $secs . 's)',
+	);
+	return $schedules;
 }
 
 function zs_fleet_ue_cron_run() {
@@ -1151,9 +1347,36 @@ function zs_fleet_ue_schedule() {
 		wp_clear_scheduled_hook( ZS_FLEET_UE_HOOK );
 		return;
 	}
-	if ( ! wp_next_scheduled( ZS_FLEET_UE_HOOK ) ) {
-		wp_schedule_event( time() + HOUR_IN_SECONDS, 'hourly', ZS_FLEET_UE_HOOK );
+
+	$secs = zs_fleet_ue_desired_interval();
+
+	// Default / unset → keep the original 'hourly' behavior (no custom schedule).
+	if ( $secs === HOUR_IN_SECONDS ) {
+		$current = wp_get_schedule( ZS_FLEET_UE_HOOK );
+		if ( $current === false ) {
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'hourly', ZS_FLEET_UE_HOOK );
+		} elseif ( $current !== 'hourly' ) {
+			// A previously custom cadence reverted to default — switch back to hourly.
+			wp_clear_scheduled_hook( ZS_FLEET_UE_HOOK );
+			wp_schedule_event( time() + HOUR_IN_SECONDS, 'hourly', ZS_FLEET_UE_HOOK );
+		}
+		return;
 	}
+
+	// Non-default interval → use the custom 'zs_fleet_ue' schedule. Reschedule only
+	// when the cadence actually changed (hook not yet on the custom schedule, OR the
+	// interval baked into the existing event differs from the desired one), so init
+	// doesn't thrash on every load. WP captures the interval into the event at
+	// schedule time; the cron_schedules filter reads it live, so we compare against
+	// the recorded recurrence to know whether a refresh is needed.
+	$current = wp_get_schedule( ZS_FLEET_UE_HOOK );
+	$event   = function_exists( 'wp_get_scheduled_event' ) ? wp_get_scheduled_event( ZS_FLEET_UE_HOOK ) : false;
+	$baked   = ( $event && isset( $event->interval ) ) ? (int) $event->interval : 0;
+	if ( $current === ZS_FLEET_UE_SCHEDULE && $baked === $secs ) {
+		return; // already on the custom schedule at the right interval.
+	}
+	wp_clear_scheduled_hook( ZS_FLEET_UE_HOOK );
+	wp_schedule_event( time() + $secs, ZS_FLEET_UE_SCHEDULE, ZS_FLEET_UE_HOOK );
 }
 
 /**
