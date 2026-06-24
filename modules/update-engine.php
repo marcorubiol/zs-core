@@ -12,12 +12,12 @@
  * Decision:      03_AGENCY/Fleet/_decisions.md § Fleet v2 — 2026-06-24
  *
  * ── SAFETY: ships INERT ──────────────────────────────────────────────────
- * With no control-plane configured (ZS_FLEET_UE_CONTROL_URL empty) and no
- * public key (ZS_FLEET_UE_PUBKEY empty), the cron path is a no-op: the engine
- * pulls nothing and applies nothing. This module can therefore ride a normal
- * release to the whole fleet and stay dormant until a site is explicitly
- * enrolled (step 3 of the migration). Until then it is reachable only via the
- * local entrypoint (zs_fleet_ue_run_local) for shadow validation on ZERO.
+ * Until a site is fully ENROLLED — control URL + public key + per-site token all
+ * set (ZS_FLEET_UE_CONTROL_URL / ZS_FLEET_UE_PUBKEY / ZS_FLEET_UE_SITE_TOKEN) —
+ * the cron path is a no-op: the engine pulls nothing and applies nothing. This
+ * module can therefore ride a normal release to the whole fleet and stay dormant
+ * until enrolled (step 3 of the migration). Until then it is reachable only via
+ * the local entrypoint (zs_fleet_ue_run_local) / the operator wrapper.
  *
  * ── Why this collapses paths A/B/C ───────────────────────────────────────
  * The engine runs inside WordPress with plugins loaded, in a legit channel
@@ -51,6 +51,10 @@ if ( ! defined( 'ZS_FLEET_UE_PUBKEY' ) ) {
 if ( ! defined( 'ZS_FLEET_UE_CONTROL_URL' ) ) {
 	// Control-plane base URL (no trailing slash). Empty → no remote pull.
 	define( 'ZS_FLEET_UE_CONTROL_URL', '' );
+}
+if ( ! defined( 'ZS_FLEET_UE_SITE_TOKEN' ) ) {
+	// Per-site check-in token, issued by the control-plane at enrollment. Empty → inert.
+	define( 'ZS_FLEET_UE_SITE_TOKEN', '' );
 }
 if ( ! defined( 'ZS_FLEET_UE_CLOCK_SKEW' ) ) {
 	define( 'ZS_FLEET_UE_CLOCK_SKEW', 120 ); // seconds of tolerance on expiry.
@@ -1055,40 +1059,57 @@ function zs_fleet_ue_pull_envelope() {
 		$url,
 		array(
 			'timeout' => 20,
-			'headers' => array( 'User-Agent' => 'zs-fleet-engine/' . ( defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : '0' ) ),
+			'headers' => array(
+				'User-Agent'      => 'zs-fleet-engine/' . ( defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : '0' ),
+				'X-ZS-Site-Token' => ZS_FLEET_UE_SITE_TOKEN,
+			),
 		)
 	);
 	if ( is_wp_error( $resp ) ) {
 		return $resp;
 	}
-	if ( (int) wp_remote_retrieve_response_code( $resp ) !== 200 ) {
-		return new WP_Error( 'pull_http', 'manifest pull HTTP ' . wp_remote_retrieve_response_code( $resp ) );
+	$code = (int) wp_remote_retrieve_response_code( $resp );
+	if ( $code !== 200 ) {
+		return new WP_Error( 'pull_http', 'manifest pull HTTP ' . $code );
 	}
 	$env = json_decode( wp_remote_retrieve_body( $resp ), true );
 	if ( ! is_array( $env ) ) {
 		return new WP_Error( 'pull_json', 'manifest pull body not JSON' );
 	}
+	// Either a signed envelope {payload,signature} or the {mode:"none"} sentinel.
 	return $env;
 }
 
-/** Report the result back to the control-plane (egress). */
-function zs_fleet_ue_report_remote( $report ) {
+/**
+ * Check in with the control-plane (egress): POST the current inventory (detect())
+ * plus the last run's report. $report may be null (nothing applied this cycle).
+ * The detect() here runs in cron context (admin_context likely false → flagged in
+ * the payload); the operator wrapper provides the complete admin-context inventory.
+ */
+function zs_fleet_ue_checkin( $report = null ) {
 	if ( ZS_FLEET_UE_CONTROL_URL === '' ) {
 		return;
+	}
+	$payload = zs_fleet_ue_detect();
+	if ( $report !== null ) {
+		$payload['report'] = $report;
 	}
 	wp_remote_post(
 		trailingslashit( ZS_FLEET_UE_CONTROL_URL ) . 'v1/checkin',
 		array(
 			'timeout' => 20,
-			'headers' => array( 'Content-Type' => 'application/json' ),
-			'body'    => wp_json_encode( $report ),
+			'headers' => array(
+				'Content-Type'    => 'application/json',
+				'X-ZS-Site-Token' => ZS_FLEET_UE_SITE_TOKEN,
+			),
+			'body'    => wp_json_encode( $payload ),
 		)
 	);
 }
 
 function zs_fleet_ue_cron_run() {
-	if ( ! zs_fleet_ue_enabled() || ZS_FLEET_UE_CONTROL_URL === '' || ZS_FLEET_UE_PUBKEY === '' ) {
-		return; // inert until enrolled.
+	if ( ! zs_fleet_ue_enabled() || ! zs_fleet_ue_enrolled() ) {
+		return; // inert until fully enrolled (control URL + pubkey + site token).
 	}
 	if ( get_transient( ZS_FLEET_UE_LOCK ) ) {
 		return;
@@ -1097,21 +1118,34 @@ function zs_fleet_ue_cron_run() {
 	try {
 		$env = zs_fleet_ue_pull_envelope();
 		if ( is_wp_error( $env ) ) {
+			error_log( '[zs-fleet] engine pull: ' . $env->get_error_message() );
+			zs_fleet_ue_checkin( null ); // still report inventory.
+			return;
+		}
+		// Nothing-to-do sentinel ({mode:"none"}) — no payload to verify.
+		if ( ! isset( $env['payload'], $env['signature'] ) ) {
+			zs_fleet_ue_checkin( null );
 			return;
 		}
 		$report = zs_fleet_ue_process_envelope( $env );
 		if ( is_wp_error( $report ) ) {
-			error_log( '[zs-fleet] engine: ' . $report->get_error_message() );
+			error_log( '[zs-fleet] engine verify: ' . $report->get_error_message() );
+			zs_fleet_ue_checkin( null );
 			return;
 		}
-		zs_fleet_ue_report_remote( $report );
+		zs_fleet_ue_checkin( $report );
 	} finally {
 		delete_transient( ZS_FLEET_UE_LOCK );
 	}
 }
 
+/** True only when the site is fully enrolled with the control-plane. */
+function zs_fleet_ue_enrolled() {
+	return ZS_FLEET_UE_CONTROL_URL !== '' && ZS_FLEET_UE_PUBKEY !== '' && ZS_FLEET_UE_SITE_TOKEN !== '';
+}
+
 function zs_fleet_ue_schedule() {
-	if ( ! zs_fleet_ue_enabled() || ZS_FLEET_UE_CONTROL_URL === '' ) {
+	if ( ! zs_fleet_ue_enabled() || ! zs_fleet_ue_enrolled() ) {
 		wp_clear_scheduled_hook( ZS_FLEET_UE_HOOK );
 		return;
 	}
