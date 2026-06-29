@@ -183,6 +183,35 @@ function zs_fleet_ue_classify( $to, $ver_after, $active_before, $active_after, $
 	return 'verify_fail';
 }
 
+/**
+ * Schema signature (pure): a deterministic sha1 over the STRUCTURAL projection of
+ * the database — table list, columns, indexes — that zs_fleet_ue_schema_signature()
+ * pulls from information_schema. Used strictly as a SAME-SERVER before/after delta
+ * around a single apply (Vía C — empirical DB-touch detection): if the signature
+ * flips, the update changed schema and a file-only rollback is unsafe (the DB ends
+ * up ahead of the restored files).
+ *
+ * Reuses zs_fleet_ue_canonical_json (NOT wp_json_encode) so it loads under the pure
+ * test stub set and so table/row ordering can never cause a spurious diff. Immunity
+ * to data churn is BY CONSTRUCTION, not by normalisation: the wrapper never selects
+ * AUTO_INCREMENT (the counter), TABLE_ROWS, DATA_LENGTH or STATISTICS.CARDINALITY —
+ * the only fields that move on ordinary INSERT/ANALYZE traffic — so there is nothing
+ * volatile in the projection to strip. The structural EXTRA='auto_increment' FLAG is
+ * kept (gaining/losing it IS real DDL); only the counter VALUE is excluded.
+ *
+ * The signature is meaningful only as a delta on ONE server (prefix/charset/MySQL
+ * version make raw hashes incomparable across sites); the engine reports a per-site
+ * boolean, never the hash for cross-site comparison.
+ *
+ * @param array $tbls table-level rows (engine/row_format/collation).
+ * @param array $cols column rows (the bulk of the DDL surface).
+ * @param array $idx  index rows (structural only — no cardinality).
+ * @return string sha1 of the canonical projection.
+ */
+function zs_fleet_ue_schema_sig( $tbls, $cols, $idx ) {
+	return sha1( zs_fleet_ue_canonical_json( array( $tbls, $cols, $idx ) ) );
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
  * SIGNATURE
  * ────────────────────────────────────────────────────────────────────────── */
@@ -596,6 +625,8 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 		'http_after'     => null,
 		'http_time_s'    => null,
 		'fingerprint_ok' => null,
+		'schema_changed' => null, // Vía C: true = measured DB-schema delta; false = measured none; null = not measured.
+		'schema_probe'   => null, // 'ok' = both reads succeeded; 'unavailable' = a read failed; null = not attempted.
 		'stash'          => '',
 		'message'        => '',
 	);
@@ -666,6 +697,13 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 		$row['message'] = 'db-touch: applied without engine rollback (host snapshot expected). ';
 	}
 
+	// Vía C — schema signature BEFORE the upgrade. Taken AFTER the stash so a
+	// failed-stash early-return wastes no read and the stash-first abort invariant
+	// is preserved (stash is a filesystem op that never touches the DB). One call
+	// covers both the file-only (stashed) and touches_db (no-stash) paths — they
+	// converge here. Best-effort: '' on a DB read failure → schema_changed stays null.
+	$schema_before = zs_fleet_ue_schema_signature();
+
 	WP_Filesystem();
 	$upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
 	$result   = $upgrader->upgrade( $pf );
@@ -710,6 +748,15 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	$row['http_time_s']    = $secs;
 	$row['fingerprint_ok'] = $fp_ok;
 
+	// Vía C — schema signature AFTER the loopback self-probe (above): the front-end
+	// hit is what fires lazy on-load (init/template_redirect) migrations. schema_changed
+	// is true ONLY on a MEASURED delta (both reads ok, before != after); a failed read
+	// → schema_probe 'unavailable' → schema_changed null (abstain — never learn from
+	// an unknown). This extends the read-disk-not-message principle to the DB.
+	$schema_after          = zs_fleet_ue_schema_signature();
+	$row['schema_probe']   = ( $schema_before === '' || $schema_after === '' ) ? 'unavailable' : 'ok';
+	$row['schema_changed'] = ( $row['schema_probe'] === 'ok' ) ? ( $schema_before !== $schema_after ) : null;
+
 	$verdict = zs_fleet_ue_classify( $to, $ver_after, $active_before, $active_after, $code, $fp_ok );
 
 	if ( $verdict === 'applied' ) {
@@ -723,9 +770,21 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	// probe's own retries) triggers rollback. A needlessly-rolled-back update
 	// is safe-but-stale and the cockpit/VRT re-adjudicates it next cycle; a site
 	// left broken is not recoverable without intervention. db-touch has no stash.
-	if ( $touches_db ) {
+	//
+	// Vía C — an update the manifest thought was file-only but that EMPIRICALLY moved
+	// the schema (schema_changed === true) inherits the SAME no-trusted-rollback
+	// treatment: a file restore would leave the DB ahead of the files = silently
+	// broken. The stash (if one was taken) is left in place for a coordinated manual
+	// file+DB recovery; the engine just never claims a clean 'rolled_back'.
+	// schema_changed === false means no schema move was OBSERVED in the front-end
+	// probe window — NOT proof of none: admin-only/deferred migrations (run from
+	// wp-admin or on a later request) are invisible here, which is why db_touch_slugs
+	// remains the operator backstop. false (unobserved) and === null (unmeasured →
+	// abstain) both fall through to the normal file rollback below, unchanged.
+	if ( $touches_db || $row['schema_changed'] === true ) {
 		$row['outcome'] = 'error';
-		$row['message'] .= 'verify failed and no rollback available (db-touch).';
+		$row['message'] .= 'verify failed and no rollback available ('
+			. ( $touches_db ? 'db-touch' : 'schema_changed → DB ahead of files, host snapshot needed' ) . ').';
 		return $row;
 	}
 	zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'verify failed →' );
@@ -758,6 +817,8 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 		'http_after'     => null,
 		'http_time_s'    => null,
 		'fingerprint_ok' => null,
+		'schema_changed' => null, // Vía C: themes have no touches_db concept — this is their ONLY DB-migration guard.
+		'schema_probe'   => null,
 		'stash'          => '',
 		'message'        => '',
 	);
@@ -819,6 +880,11 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	}
 	$row['stash'] = str_replace( trailingslashit( WP_CONTENT_DIR ), '', $stash );
 
+	// Vía C — schema signature BEFORE the theme upgrade (after the stash). Themes
+	// carry no touches_db concept, so this before/after delta is their ONLY guard
+	// against a theme that runs a DB migration. Best-effort: '' on a read failure.
+	$schema_before = zs_fleet_ue_schema_signature();
+
 	WP_Filesystem();
 	$upgrader = new Theme_Upgrader( new Automatic_Upgrader_Skin() );
 	$result   = $upgrader->upgrade( $slug );
@@ -839,9 +905,26 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	$row['http_time_s']    = $secs;
 	$row['fingerprint_ok'] = $fp_ok;
 
+	// Vía C — schema signature AFTER the loopback self-probe (above), mirroring the
+	// plugin path. schema_changed true only on a measured delta; '' read → null/abstain.
+	$schema_after          = zs_fleet_ue_schema_signature();
+	$row['schema_probe']   = ( $schema_before === '' || $schema_after === '' ) ? 'unavailable' : 'ok';
+	$row['schema_changed'] = ( $row['schema_probe'] === 'ok' ) ? ( $schema_before !== $schema_after ) : null;
+
 	if ( $ver_after === $to && $code === 200 && $fp_ok ) {
 		$row['outcome'] = 'applied';
 		zs_fleet_ue_prune_stashes( $slug );
+		return $row;
+	}
+	// Vía C — a theme that empirically moved the schema has no safe file rollback
+	// (file restore would leave the DB ahead of the files). Themes have no touches_db
+	// concept, so this is their ONLY DB-migration guard — mirror the plugin no-rollback
+	// branch: outcome=error, leave the stash for coordinated manual recovery, never
+	// claim a clean 'rolled_back'. schema_changed false/null fall through to the normal
+	// theme file rollback below.
+	if ( $row['schema_changed'] === true ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'theme verify failed and no safe rollback (schema_changed → DB ahead of files, host snapshot needed).';
 		return $row;
 	}
 	zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme verify failed →' );
@@ -1181,6 +1264,90 @@ function zs_fleet_ue_detect() {
 		'plugins'        => $plugins,
 		'themes'         => $themes,
 	);
+}
+
+/**
+ * Capture a deterministic schema signature from information_schema (impure — the
+ * single $wpdb boundary; the hashing is done by the pure zs_fleet_ue_schema_sig).
+ * Vía C: a same-server before/after delta around an apply. Exactly 3 reads, flat
+ * regardless of table count (a few ms, dwarfed by the file stash + http probe).
+ *
+ * BEST-EFFORT, like the http self-probe: any read failure (locked-down host that
+ * revokes information_schema, a timeout, a column unsupported on an ancient MySQL)
+ * returns '' — never fatals an apply. '' makes the caller ABSTAIN (schema_changed
+ * stays null): it must gate/abstain, never silently green-light a file rollback.
+ *
+ * Scope = this install's own database (TABLE_SCHEMA = DATABASE()) so a plugin that
+ * names tables outside the wp_ prefix is still covered — minimising the DANGEROUS
+ * false-negative. Every selected column is STRUCTURAL and data-invariant; the
+ * volatile counters/row-counts/cardinality are deliberately never read (see the
+ * pure helper's contract), so INSERT/ANALYZE traffic cannot move the signature.
+ *
+ * KNOWN FALSE-NEGATIVE BLIND SPOTS — schema moves this projection cannot see, so a
+ * migration confined to any of them flips no signature here: VIEWS, TRIGGERS, stored
+ * ROUTINES (procedures/functions), FOREIGN KEY / referential constraints, CHECK
+ * constraints, and in-place MySQL-8 changes to a functional index's EXPRESSION or to
+ * index VISIBILITY. db_touch_slugs (the curated ∪ learned operator backstop) is what
+ * covers these; Vía C narrows that list, it never replaces it.
+ *
+ * @return string sha1 signature, or '' if any read failed.
+ */
+function zs_fleet_ue_schema_signature() {
+	global $wpdb;
+	if ( empty( $wpdb ) || ! is_object( $wpdb ) || ! method_exists( $wpdb, 'get_results' ) ) {
+		return '';
+	}
+	try {
+		$scope = 'TABLE_SCHEMA = DATABASE()';
+
+		// COLUMNS: the bulk of the DDL surface. EXTRA carries only the structural
+		// 'auto_increment' FLAG, never a counter — invariant to inserts.
+		$cols = $wpdb->get_results(
+			"SELECT c.TABLE_NAME, c.COLUMN_NAME, c.ORDINAL_POSITION, c.COLUMN_TYPE,
+			        c.IS_NULLABLE, c.COLUMN_DEFAULT, c.EXTRA, c.COLLATION_NAME,
+			        c.GENERATION_EXPRESSION
+			   FROM information_schema.COLUMNS c
+			   JOIN information_schema.TABLES t
+			     ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME
+			  WHERE c.{$scope} AND t.TABLE_TYPE = 'BASE TABLE'
+			  ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION",
+			ARRAY_N
+		);
+		if ( $cols === null ) {
+			return '';
+		}
+
+		// STATISTICS (indexes): structural only. CARDINALITY is deliberately NOT
+		// selected — it tracks data distribution and moves on INSERT + ANALYZE.
+		$idx = $wpdb->get_results(
+			"SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME,
+			        NON_UNIQUE, SUB_PART, INDEX_TYPE, NULLABLE, COLLATION
+			   FROM information_schema.STATISTICS
+			  WHERE {$scope}
+			  ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+			ARRAY_N
+		);
+		if ( $idx === null ) {
+			return '';
+		}
+
+		// TABLES (table-level): engine / row_format / collation only. AUTO_INCREMENT,
+		// TABLE_ROWS, DATA_LENGTH, CREATE_TIME, UPDATE_TIME, CHECKSUM all excluded.
+		$tbls = $wpdb->get_results(
+			"SELECT TABLE_NAME, ENGINE, ROW_FORMAT, TABLE_COLLATION
+			   FROM information_schema.TABLES
+			  WHERE {$scope} AND TABLE_TYPE = 'BASE TABLE'
+			  ORDER BY TABLE_NAME",
+			ARRAY_N
+		);
+		if ( $tbls === null ) {
+			return '';
+		}
+
+		return zs_fleet_ue_schema_sig( $tbls, $cols, $idx );
+	} catch ( \Throwable $e ) {
+		return '';
+	}
 }
 
 /**

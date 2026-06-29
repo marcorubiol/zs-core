@@ -195,5 +195,146 @@ check( $pending[0]['type'] === 'plugin' && $pending[0]['slug'] === 'foo' && $pen
 check( $pending[1]['type'] === 'theme' && $pending[1]['slug'] === 'bricks' && $pending[1]['to'] === '2.3.8', 'pending theme shape' );
 check( zs_fleet_ue_pending( array() ) === array(), 'pending handles empty detect' );
 
+/* ── schema signature (Vía C empirical DB-touch detection) ───────────────── */
+// zs_fleet_ue_schema_sig hashes the STRUCTURAL projection that the impure
+// zs_fleet_ue_schema_signature() wrapper pulls from information_schema (ARRAY_N
+// rows). The wrapper NEVER selects AUTO_INCREMENT (the counter), TABLE_ROWS,
+// DATA_LENGTH or STATISTICS.CARDINALITY, so ordinary data churn cannot even reach
+// this function — immunity is BY CONSTRUCTION (the wrapper's column selection),
+// validated live on the canary. The structural EXTRA='auto_increment' FLAG IS
+// projected, because gaining/losing it is real DDL. No DB or shim needed here:
+// these are the exact projection shapes the wrapper produces.
+//
+// COLUMNS rows: [TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, COLUMN_TYPE,
+//   IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLLATION_NAME, GENERATION_EXPRESSION].
+// STATISTICS rows: [TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE,
+//   SUB_PART, INDEX_TYPE, NULLABLE, COLLATION].
+// TABLES rows: [TABLE_NAME, ENGINE, ROW_FORMAT, TABLE_COLLATION].
+$ss_tbls = array(
+	array( 'wp_options', 'InnoDB', 'Dynamic', 'utf8mb4_unicode_520_ci' ),
+	array( 'wp_posts', 'InnoDB', 'Dynamic', 'utf8mb4_unicode_520_ci' ),
+);
+$ss_cols = array(
+	array( 'wp_options', 'option_id', '1', 'bigint unsigned', 'NO', null, 'auto_increment', null, null ),
+	array( 'wp_options', 'option_name', '2', 'varchar(191)', 'NO', '', '', 'utf8mb4_unicode_520_ci', null ),
+	array( 'wp_options', 'option_value', '3', 'longtext', 'NO', null, '', 'utf8mb4_unicode_520_ci', null ),
+	array( 'wp_posts', 'ID', '1', 'bigint unsigned', 'NO', null, 'auto_increment', null, null ),
+	array( 'wp_posts', 'post_title', '2', 'text', 'NO', null, '', 'utf8mb4_unicode_520_ci', null ),
+);
+$ss_idx = array(
+	array( 'wp_options', 'PRIMARY', '1', 'option_id', '0', null, 'BTREE', '', 'A' ),
+	array( 'wp_options', 'option_name', '1', 'option_name', '0', null, 'BTREE', '', 'A' ),
+	array( 'wp_posts', 'PRIMARY', '1', 'ID', '0', null, 'BTREE', '', 'A' ),
+);
+$sig_base = zs_fleet_ue_schema_sig( $ss_tbls, $ss_cols, $ss_idx );
+
+check( is_string( $sig_base ) && preg_match( '/^[0-9a-f]{40}$/', $sig_base ) === 1, 'schema sig is a 40-char sha1 hex' );
+check( zs_fleet_ue_schema_sig( $ss_tbls, $ss_cols, $ss_idx ) === $sig_base, 'schema sig deterministic for identical projection' );
+
+// DATA CHURN (the AUTO_INCREMENT trap): an INSERT bumps the auto_increment counter,
+// TABLE_ROWS and index CARDINALITY — none of which the wrapper projects. The
+// before/after projection is therefore byte-identical; rebuilt below as fresh
+// literals (not a `= $ss_*` copy) to make that explicit. Must NOT flip the sig.
+$churn_tbls = array(
+	array( 'wp_options', 'InnoDB', 'Dynamic', 'utf8mb4_unicode_520_ci' ),
+	array( 'wp_posts', 'InnoDB', 'Dynamic', 'utf8mb4_unicode_520_ci' ),
+);
+$churn_cols = array(
+	array( 'wp_options', 'option_id', '1', 'bigint unsigned', 'NO', null, 'auto_increment', null, null ),
+	array( 'wp_options', 'option_name', '2', 'varchar(191)', 'NO', '', '', 'utf8mb4_unicode_520_ci', null ),
+	array( 'wp_options', 'option_value', '3', 'longtext', 'NO', null, '', 'utf8mb4_unicode_520_ci', null ),
+	array( 'wp_posts', 'ID', '1', 'bigint unsigned', 'NO', null, 'auto_increment', null, null ),
+	array( 'wp_posts', 'post_title', '2', 'text', 'NO', null, '', 'utf8mb4_unicode_520_ci', null ),
+);
+$churn_idx = array(
+	array( 'wp_options', 'PRIMARY', '1', 'option_id', '0', null, 'BTREE', '', 'A' ),
+	array( 'wp_options', 'option_name', '1', 'option_name', '0', null, 'BTREE', '', 'A' ),
+	array( 'wp_posts', 'PRIMARY', '1', 'ID', '0', null, 'BTREE', '', 'A' ),
+);
+check( zs_fleet_ue_schema_sig( $churn_tbls, $churn_cols, $churn_idx ) === $sig_base, 'data churn (AUTO_INCREMENT/rows/cardinality not projected) → schema sig UNCHANGED' );
+
+// ── DDL changes must FLIP the signature (this is the empirical detection) ──
+$cols_addcol   = $ss_cols;
+$cols_addcol[] = array( 'wp_options', 'autoload', '4', 'varchar(20)', 'NO', 'yes', '', 'utf8mb4_unicode_520_ci', null );
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_addcol, $ss_idx ) !== $sig_base, 'added column → schema sig FLIPS' );
+
+$idx_addidx   = $ss_idx;
+$idx_addidx[] = array( 'wp_posts', 'post_title', '1', 'post_title', '1', '191', 'BTREE', '', 'A' );
+check( zs_fleet_ue_schema_sig( $ss_tbls, $ss_cols, $idx_addidx ) !== $sig_base, 'added index → schema sig FLIPS' );
+
+$tbls_addtbl   = $ss_tbls;
+$tbls_addtbl[] = array( 'wp_woocommerce_sessions', 'InnoDB', 'Dynamic', 'utf8mb4_unicode_520_ci' );
+check( zs_fleet_ue_schema_sig( $tbls_addtbl, $ss_cols, $ss_idx ) !== $sig_base, 'added table → schema sig FLIPS' );
+
+$cols_type       = $ss_cols;
+$cols_type[0][3] = 'int unsigned'; // bigint → int
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_type, $ss_idx ) !== $sig_base, 'changed column type → schema sig FLIPS' );
+
+$cols_coll       = $ss_cols;
+$cols_coll[1][7] = 'utf8mb4_general_ci';
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_coll, $ss_idx ) !== $sig_base, 'changed collation → schema sig FLIPS' );
+
+$cols_null       = $ss_cols;
+$cols_null[1][4] = 'YES';
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_null, $ss_idx ) !== $sig_base, 'changed nullability → schema sig FLIPS' );
+
+$cols_def       = $ss_cols;
+$cols_def[3][5] = '0'; // COLUMN_DEFAULT null → '0'
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_def, $ss_idx ) !== $sig_base, 'changed default → schema sig FLIPS' );
+
+// Structural auto_increment FLAG gained — proves the FLAG is in the signature even
+// though the counter VALUE never is (the core of the AUTO_INCREMENT-immunity claim).
+$cols_flag       = $ss_cols;
+$cols_flag[1][6] = 'auto_increment';
+check( zs_fleet_ue_schema_sig( $ss_tbls, $cols_flag, $ss_idx ) !== $sig_base, 'gained auto_increment FLAG → schema sig FLIPS (flag structural; counter excluded)' );
+
+// Empty schema (brand-new / locked-down DB): stable and distinct from a populated one.
+check( zs_fleet_ue_schema_sig( array(), array(), array() ) === zs_fleet_ue_schema_sig( array(), array(), array() ), 'empty schema sig stable' );
+check( zs_fleet_ue_schema_sig( array(), array(), array() ) !== $sig_base, 'empty schema differs from populated' );
+
+/* ── schema_signature SELECT invariant (regression guard, Vía C) ──────────── */
+// The "immune to data churn BY CONSTRUCTION" claim lives in the impure wrapper's
+// COLUMN SELECTION, not in any normalisation step — so it can only be enforced by
+// inspecting the actual SQL the wrapper issues. This guard reads the wrapper source
+// (ReflectionFunction → exact line slice) and asserts every SELECT projects the
+// structural columns and NONE of the volatile ones. A future edit that adds
+// AUTO_INCREMENT, TABLE_ROWS, DATA_LENGTH or CARDINALITY to a SELECT then fails CI
+// here, before it can spuriously flip the signature on ordinary INSERT/ANALYZE
+// traffic. Kept in this suite (no DB needed) so release.yml needs no change.
+//
+// The volatile names legitimately appear in the function's CODE COMMENTS ("…
+// AUTO_INCREMENT … excluded"), so a naive scan of the raw source would false-FAIL.
+// We therefore extract ONLY the string-literal tokens (the SQL itself) via
+// token_get_all and ignore comments — testing the SELECT strings, not the prose.
+$ue_ref   = new ReflectionFunction( 'zs_fleet_ue_schema_signature' );
+$ue_lines = array_slice(
+	file( $ue_ref->getFileName() ),
+	$ue_ref->getStartLine() - 1,
+	$ue_ref->getEndLine() - $ue_ref->getStartLine() + 1
+);
+$ue_sql = '';
+foreach ( token_get_all( "<?php\n" . implode( '', $ue_lines ) ) as $tok ) {
+	if ( is_array( $tok ) && in_array( $tok[0], array( T_ENCAPSED_AND_WHITESPACE, T_CONSTANT_ENCAPSED_STRING ), true ) ) {
+		$ue_sql .= ' ' . $tok[1];
+	}
+}
+$ue_sql = strtoupper( $ue_sql );
+
+// MUST project every structural column the detection relies on.
+foreach ( array(
+	'TABLE_NAME', 'COLUMN_NAME', 'ORDINAL_POSITION', 'COLUMN_TYPE', 'IS_NULLABLE',
+	'COLUMN_DEFAULT', 'EXTRA', 'COLLATION_NAME', 'GENERATION_EXPRESSION',
+	'INDEX_NAME', 'SEQ_IN_INDEX', 'NON_UNIQUE', 'SUB_PART', 'INDEX_TYPE',
+	'ENGINE', 'ROW_FORMAT', 'TABLE_COLLATION',
+) as $must ) {
+	check( strpos( $ue_sql, $must ) !== false, "schema_signature SELECT projects structural column $must" );
+}
+
+// MUST NOT project any volatile column — these move on ordinary INSERT/ANALYZE and
+// would make the signature flip on data churn (the false-positive trap Vía C avoids).
+foreach ( array( 'AUTO_INCREMENT', 'TABLE_ROWS', 'DATA_LENGTH', 'CARDINALITY' ) as $banned ) {
+	check( strpos( $ue_sql, $banned ) === false, "schema_signature SELECT excludes volatile column $banned" );
+}
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );
