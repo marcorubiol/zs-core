@@ -664,6 +664,15 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	// gated: DB-touching updates carry no rollback promise (decision 7).
 	$touches_db = ! empty( $update['touches_db'] );
 
+	// Operator force-override (manual /v1/issue only): accept a version-STRING
+	// mismatch when every HEALTH gate still passes. For premium updaters whose
+	// on-disk version header lies in cron/CLI context (the wp-compress class), the
+	// version check is a false-negative; force lets the operator vouch for the
+	// result. It NEVER relaxes the health gates (active/HTTP/fingerprint) and NEVER
+	// applies to db-touch / schema-moving updates — a file-only swap the operator
+	// has confirmed is the only thing it waves through.
+	$force = ! empty( $update['force'] );
+
 	// Refresh the update transient WITH plugins loaded so premium update servers
 	// register (the Path C "invisible" case). One plugin per resolve — no
 	// multi-slug transient invalidation.
@@ -765,6 +774,22 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 		return $row;
 	}
 
+	// ── force-override: version mismatch ONLY, health gates all green ──
+	// Guarded against db-touch / measured schema move (those keep the no-trusted-
+	// rollback treatment below). Recorded explicitly so the report/timeline never
+	// shows a forced apply as a clean match.
+	if ( $force && ! $touches_db && $row['schema_changed'] !== true ) {
+		$active_ok = ( ! $active_before ) || $active_after;
+		if ( ( (string) $ver_after !== (string) $to ) && $active_ok && (int) $code === 200 && $fp_ok ) {
+			$row['outcome']                   = 'applied';
+			$row['forced']                    = true;
+			$row['version_mismatch_accepted'] = true;
+			$row['message']                  .= 'forced: on-disk ' . $ver_after . ' != target ' . $to . ', accepted by operator (health gates passed). ';
+			zs_fleet_ue_prune_stashes( $slug );
+			return $row;
+		}
+	}
+
 	// ── verify failed → ROLLBACK ──
 	// Conservative for unattended autonomy: a persistent non-200 (after the
 	// probe's own retries) triggers rollback. A needlessly-rolled-back update
@@ -835,6 +860,8 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 		return $row;
 	}
 	$themes_dir = get_theme_root( $slug );
+
+	$force = ! empty( $update['force'] ); // operator version-mismatch override (see apply_one).
 
 	$ver_before            = (string) $theme->get( 'Version' );
 	$row['version_before'] = $ver_before;
@@ -913,6 +940,15 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 
 	if ( $ver_after === $to && $code === 200 && $fp_ok ) {
 		$row['outcome'] = 'applied';
+		zs_fleet_ue_prune_stashes( $slug );
+		return $row;
+	}
+	// force-override: version mismatch ONLY, health green, no schema move (see apply_one).
+	if ( $force && $row['schema_changed'] !== true && (string) $ver_after !== (string) $to && $code === 200 && $fp_ok ) {
+		$row['outcome']                   = 'applied';
+		$row['forced']                    = true;
+		$row['version_mismatch_accepted'] = true;
+		$row['message']                  .= 'forced: theme on-disk ' . $ver_after . ' != target ' . $to . ', accepted by operator (health gates passed). ';
 		zs_fleet_ue_prune_stashes( $slug );
 		return $row;
 	}
