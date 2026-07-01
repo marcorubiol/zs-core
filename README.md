@@ -100,10 +100,13 @@ scp    zs-fleet-loader.php      site:/path/to/wp-content/mu-plugins/
 ```
 
 To force an update right now (e.g. just published a fix and don't
-want to wait the daily cron) — hit the public trigger URL:
+want to wait the daily cron) — hit the trigger URL. It requires a
+logged-in `manage_options` operator, or a shared secret
+(`ZS_FLEET_AU_TRIGGER_SECRET` in `wp-config.php`) passed as
+`?zs_fleet_secret=…`:
 
 ```bash
-curl -s "https://site.example/?zs_fleet_check_now=1"
+curl -s "https://site.example/?zs_fleet_check_now=1&zs_fleet_secret=<secret>"
 # version_before: 0.1.5
 # version_after:  0.1.6
 # updated:        yes
@@ -119,8 +122,9 @@ For the whole fleet, use the included push script (manifest at
 
 The trigger is idempotent: if the site is already on the latest
 version the downloaded zip is discarded. An internal 5-minute
-transient lock caps how often the real work can run, so the URL
-is safe to expose without auth.
+transient lock caps how often the real work can run. The swap
+itself is signature-gated (see _Release signing_ below), so the
+trigger can only ever install a validly-signed release.
 
 ## Canary releases
 
@@ -164,3 +168,27 @@ Release checklist (do not skip — header and tag must match):
 2. Bump `Version:` in `deploy/zs-fleet-loader.php` header.
 3. Commit with message `release: vX.Y.Z`.
 4. Tag `vX.Y.Z` and push tag — the GitHub Action builds the zip.
+5. **Sign the release (mandatory once a sig-checking build is live).**
+   Download the published `zs-fleet.zip` asset, sign it locally, and
+   upload the resulting `.sig` to the SAME release:
+
+   ```bash
+   gh release download vX.Y.Z --repo marcorubiol/zs-core --pattern 'zs-fleet.zip'
+   ZS_RELEASE_SIGNING_SK="<base64 signing key>" php deploy/sign-release.php zs-fleet.zip
+   # Confirm the printed public key equals ZS_FLEET_UE_PUBKEY, then:
+   gh release upload vX.Y.Z --repo marcorubiol/zs-core zs-fleet.zip.sig
+   ```
+
+## Release signing
+
+Since v0.3.x the fleet self-updater (`modules/auto-update.php`) and the
+first-install loader refuse to swap a downloaded zip unless a detached
+Ed25519 `.sig` verifies over the exact zip bytes, using the fleet public
+key `ZS_FLEET_UE_PUBKEY`. The private signing key lives only in the
+control-plane / operator vault and is passed to `deploy/sign-release.php`
+via `ZS_RELEASE_SIGNING_SK` — never in CI, never printed.
+
+Fail-closed: a release published WITHOUT a valid `.sig` will not be
+applied by the fleet (the self-update stops until a signed release
+appears). This is intended — an unsigned or tampered zip is refused
+rather than installed. Sign every release from v0.3.x onward.

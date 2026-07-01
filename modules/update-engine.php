@@ -61,11 +61,24 @@ if ( ! defined( 'ZS_FLEET_UE_SITE_TOKEN' ) ) {
 if ( ! defined( 'ZS_FLEET_UE_CLOCK_SKEW' ) ) {
 	define( 'ZS_FLEET_UE_CLOCK_SKEW', 120 ); // seconds of tolerance on expiry.
 }
+if ( ! defined( 'ZS_FLEET_UE_HEALTH_URL' ) ) {
+	// URL the post-apply loopback probe hits. '' → home_url('/'). Override per-site
+	// to hit the ORIGIN directly (e.g. 'https://origin.example/') so a Cloudflare
+	// challenge / auth wall / maintenance page on the edge can't make a healthy
+	// apply look broken. Must still return a fully-rendered page (fingerprint gate).
+	define( 'ZS_FLEET_UE_HEALTH_URL', '' );
+}
+if ( ! defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ) {
+	// HTTP status the probe treats as healthy. Default 200; override only if the
+	// health URL legitimately answers with a different success code.
+	define( 'ZS_FLEET_UE_HEALTH_EXPECT', 200 );
+}
 
 const ZS_FLEET_UE_HOOK          = 'zs_fleet_ue_pull';
 const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue_lock';
 const ZS_FLEET_UE_OPT_NONCES    = 'zs_fleet_ue_consumed_nonces'; // replay guard
 const ZS_FLEET_UE_OPT_REPORT    = 'zs_fleet_ue_last_report';
+const ZS_FLEET_UE_OPT_UNACKED   = 'zs_fleet_ue_unacked_report';  // last report not yet 2xx-acked by the control-plane
 const ZS_FLEET_UE_OPT_INTERVAL  = 'zs_fleet_ue_interval';        // control-plane-driven check-in cadence (seconds)
 const ZS_FLEET_UE_SCHEDULE      = 'zs_fleet_ue';                 // custom cron schedule name (interval = the option above)
 const ZS_FLEET_UE_INTERVAL_MIN  = 300;                           // 5 min floor
@@ -176,7 +189,7 @@ function zs_fleet_ue_not_expired( $expires_at, $now ) {
 function zs_fleet_ue_classify( $to, $ver_after, $active_before, $active_after, $http_after, $fingerprint_ok ) {
 	$version_ok = ( (string) $ver_after === (string) $to );
 	$active_ok  = ( ! $active_before ) || ( $active_before && $active_after );
-	$http_ok    = ( (int) $http_after === 200 );
+	$http_ok    = ( (int) $http_after === (int) ( defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ? ZS_FLEET_UE_HEALTH_EXPECT : 200 ) );
 	if ( $version_ok && $active_ok && $http_ok && $fingerprint_ok ) {
 		return 'applied';
 	}
@@ -309,8 +322,12 @@ function zs_fleet_ue_http_self() {
 	$code = 0;
 	$secs = 0;
 	$body = '';
+	$base = ( defined( 'ZS_FLEET_UE_HEALTH_URL' ) && ZS_FLEET_UE_HEALTH_URL !== '' )
+		? ZS_FLEET_UE_HEALTH_URL
+		: home_url( '/' );
+	$expect = (int) ( defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ? ZS_FLEET_UE_HEALTH_EXPECT : 200 );
 	for ( $attempt = 1; $attempt <= 3; $attempt++ ) {
-		$url   = add_query_arg( 'zs_fleet_probe', (string) ( time() + $attempt ), home_url( '/' ) );
+		$url   = add_query_arg( 'zs_fleet_probe', (string) ( time() + $attempt ), $base );
 		$start = microtime( true );
 		$resp  = wp_remote_get(
 			$url,
@@ -333,14 +350,58 @@ function zs_fleet_ue_http_self() {
 			$code = (int) wp_remote_retrieve_response_code( $resp );
 			$body = (string) wp_remote_retrieve_body( $resp );
 		}
-		if ( $code === 200 ) {
+		if ( $code === $expect ) {
 			break;
 		}
 		if ( $attempt < 3 ) {
-			usleep( 400000 ); // brief backoff before retrying a non-200.
+			usleep( 400000 ); // brief backoff before retrying a non-expected code.
 		}
 	}
 	return array( $code, $secs, $body );
+}
+
+/**
+ * Distinguish "cannot verify" from "broken" for a post-apply probe result.
+ *
+ * A persistent challenge / auth / rate-limit response (401, 403, 429, or a
+ * Cloudflare "Just a moment"/JS-challenge 503 body) means the edge, not the
+ * apply, produced the non-200 — we CANNOT conclude the update broke the site.
+ * Callers must escalate ('health_probe_blocked'), never auto-rollback (which
+ * would loop apply→rollback forever on a good update behind a challenge) and
+ * never falsely report 'applied'. 5xx / connection error (code 0) / timeout are
+ * deliberately OUTSIDE this set → they stay "broken" and the rollback safety net
+ * fires as before. Overriding ZS_FLEET_UE_HEALTH_URL to hit origin is the real
+ * fix; this classifier is the fail-loud backstop when the edge is unavoidable.
+ */
+function zs_fleet_ue_health_blocked( $code, $body ) {
+	$code = (int) $code;
+	if ( $code === 401 || $code === 403 || $code === 429 ) {
+		return true;
+	}
+	if ( $code === 503 && $body !== '' && (
+		stripos( $body, 'Just a moment' ) !== false
+		|| stripos( $body, 'cf-browser-verification' ) !== false
+		|| stripos( $body, 'Checking your browser' ) !== false
+		|| stripos( $body, '__cf_chl' ) !== false
+	) ) {
+		return true;
+	}
+	return false;
+}
+
+/**
+ * Raise time/memory ceilings before a real apply. Plugin_Upgrader can be slow on
+ * a large premium zip; the default 30s/128M can trip a fatal mid-swap (which then
+ * skips try/finally — see the cron shutdown net). No-op-safe on hosts that disable
+ * set_time_limit.
+ */
+function zs_fleet_ue_raise_limits() {
+	if ( function_exists( 'set_time_limit' ) ) {
+		@set_time_limit( 0 );
+	}
+	if ( function_exists( 'wp_raise_memory_limit' ) ) {
+		wp_raise_memory_limit( 'admin' );
+	}
 }
 
 /** Cheap content fingerprint (Nivel 1): no PHP fatal, has a closing </html>. */
@@ -551,7 +612,7 @@ function zs_fleet_ue_rollback( &$row, $slug, $pf, $stash, $from, $active_before,
 
 	// $from may be '' in rollback mode (the prior version isn't pinned — the
 	// stash IS the source of truth); only enforce the version match when known.
-	$healthy = ( $code === 200 ) && $fp_ok
+	$healthy = ( $code === (int) ZS_FLEET_UE_HEALTH_EXPECT ) && $fp_ok
 		&& ( $from === '' || (string) $ver_after === (string) $from )
 		&& ( ! $active_before || $active_after );
 
@@ -693,6 +754,7 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	}
 
 	// ── APPLY ──
+	zs_fleet_ue_raise_limits();
 	if ( ! $touches_db ) {
 		$stash = zs_fleet_ue_stash_plugin( $slug, $ver_before );
 		if ( is_wp_error( $stash ) ) {
@@ -766,6 +828,19 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	$row['schema_probe']   = ( $schema_before === '' || $schema_after === '' ) ? 'unavailable' : 'ok';
 	$row['schema_changed'] = ( $row['schema_probe'] === 'ok' ) ? ( $schema_before !== $schema_after ) : null;
 
+	// Health probe blocked by the edge (challenge / auth / rate-limit) → we CANNOT
+	// verify runtime health. Leave the applied files in place (do NOT roll back a
+	// possibly-good update into an apply→rollback loop) and do NOT claim 'applied'.
+	// Report 'error' + a distinct reason and escalate loudly so the operator checks.
+	if ( zs_fleet_ue_health_blocked( $code, $body ) ) {
+		$row['outcome']  = 'error';
+		$row['reason']   = 'health_probe_blocked';
+		$row['message'] .= 'CANNOT VERIFY: health probe blocked (HTTP ' . (int) $code . ' — challenge/auth/rate-limit); left applied, no rollback, operator must verify. ';
+		zs_fleet_ue_breadcrumb( $slug, 'health_probe_blocked', $row );
+		error_log( '[zs-fleet] CRITICAL health_probe_blocked for ' . $slug . ' at ' . home_url() . ' (HTTP ' . (int) $code . ')' );
+		return $row;
+	}
+
 	$verdict = zs_fleet_ue_classify( $to, $ver_after, $active_before, $active_after, $code, $fp_ok );
 
 	if ( $verdict === 'applied' ) {
@@ -780,7 +855,7 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	// shows a forced apply as a clean match.
 	if ( $force && ! $touches_db && $row['schema_changed'] !== true ) {
 		$active_ok = ( ! $active_before ) || $active_after;
-		if ( ( (string) $ver_after !== (string) $to ) && $active_ok && (int) $code === 200 && $fp_ok ) {
+		if ( ( (string) $ver_after !== (string) $to ) && $active_ok && (int) $code === (int) ZS_FLEET_UE_HEALTH_EXPECT && $fp_ok ) {
 			$row['outcome']                   = 'applied';
 			$row['forced']                    = true;
 			$row['version_mismatch_accepted'] = true;
@@ -899,6 +974,7 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	}
 
 	// ── APPLY (stash-first, like plugins; base = themes dir) ──
+	zs_fleet_ue_raise_limits();
 	$stash = zs_fleet_ue_stash_plugin( $slug, $ver_before, $themes_dir );
 	if ( is_wp_error( $stash ) ) {
 		$row['outcome'] = 'error';
@@ -938,13 +1014,24 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	$row['schema_probe']   = ( $schema_before === '' || $schema_after === '' ) ? 'unavailable' : 'ok';
 	$row['schema_changed'] = ( $row['schema_probe'] === 'ok' ) ? ( $schema_before !== $schema_after ) : null;
 
-	if ( $ver_after === $to && $code === 200 && $fp_ok ) {
+	// Health probe blocked by the edge → cannot verify. Mirror the plugin path:
+	// leave the applied theme in place, no rollback loop, no false 'applied', escalate.
+	if ( zs_fleet_ue_health_blocked( $code, $body ) ) {
+		$row['outcome']  = 'error';
+		$row['reason']   = 'health_probe_blocked';
+		$row['message'] .= 'CANNOT VERIFY: health probe blocked (HTTP ' . (int) $code . ' — challenge/auth/rate-limit); left applied, no rollback, operator must verify. ';
+		zs_fleet_ue_breadcrumb( $slug, 'theme_health_probe_blocked', $row );
+		error_log( '[zs-fleet] CRITICAL theme health_probe_blocked for ' . $slug . ' at ' . home_url() . ' (HTTP ' . (int) $code . ')' );
+		return $row;
+	}
+
+	if ( $ver_after === $to && $code === (int) ZS_FLEET_UE_HEALTH_EXPECT && $fp_ok ) {
 		$row['outcome'] = 'applied';
 		zs_fleet_ue_prune_stashes( $slug );
 		return $row;
 	}
 	// force-override: version mismatch ONLY, health green, no schema move (see apply_one).
-	if ( $force && $row['schema_changed'] !== true && (string) $ver_after !== (string) $to && $code === 200 && $fp_ok ) {
+	if ( $force && $row['schema_changed'] !== true && (string) $ver_after !== (string) $to && $code === (int) ZS_FLEET_UE_HEALTH_EXPECT && $fp_ok ) {
 		$row['outcome']                   = 'applied';
 		$row['forced']                    = true;
 		$row['version_mismatch_accepted'] = true;
@@ -994,7 +1081,7 @@ function zs_fleet_ue_rollback_theme( &$row, $slug, $stash, $from, $themes_dir, $
 	$row['fingerprint_ok'] = $fp_ok;
 
 	// $from may be '' in rollback mode (prior version not pinned — stash is truth).
-	$healthy = ( $code === 200 ) && $fp_ok && ( $from === '' || $ver_after === (string) $from );
+	$healthy = ( $code === (int) ZS_FLEET_UE_HEALTH_EXPECT ) && $fp_ok && ( $from === '' || $ver_after === (string) $from );
 	if ( $healthy ) {
 		$row['outcome']  = 'rolled_back';
 		$row['message'] .= $reason . ' restored to ' . $ver_after . ' (verified healthy).';
@@ -1456,6 +1543,22 @@ function zs_fleet_ue_checkin( $report = null ) {
 	if ( ZS_FLEET_UE_CONTROL_URL === '' ) {
 		return;
 	}
+
+	// Durable report delivery: a rolled_back / error report is what drives the
+	// control-plane's auto-freeze, so it must survive a failed POST. Persist the
+	// newest report as 'unacked' and clear it ONLY on a 2xx checkin ack. When this
+	// cycle produced no new report, retry any still-unacked one from a prior cycle
+	// (with the fresh inventory). Bounded to the single most-recent report — a new
+	// report overwrites the old one, no unbounded queue.
+	if ( $report !== null ) {
+		update_option( ZS_FLEET_UE_OPT_UNACKED, $report, false );
+	} else {
+		$pending = get_option( ZS_FLEET_UE_OPT_UNACKED, null );
+		if ( is_array( $pending ) ) {
+			$report = $pending;
+		}
+	}
+
 	$payload = zs_fleet_ue_detect();
 	if ( $report !== null ) {
 		$payload['report'] = $report;
@@ -1471,20 +1574,27 @@ function zs_fleet_ue_checkin( $report = null ) {
 			'body'    => wp_json_encode( $payload ),
 		)
 	);
+	if ( is_wp_error( $resp ) ) {
+		return; // transport failure — unacked report stays for the next cycle.
+	}
+
+	$code = (int) wp_remote_retrieve_response_code( $resp );
+	if ( $code >= 200 && $code < 300 ) {
+		// Acked — the control-plane has the report; safe to drop the retry copy.
+		delete_option( ZS_FLEET_UE_OPT_UNACKED );
+	}
 
 	// Cadence control: honor a `next_checkin_seconds` the control-plane returns,
 	// clamped to [MIN, MAX]. Persist only on a real change so init's reschedule
 	// stays idempotent. The schedule itself is re-applied by zs_fleet_ue_schedule().
-	if ( ! is_wp_error( $resp ) ) {
-		$body = json_decode( (string) wp_remote_retrieve_body( $resp ), true );
-		if ( is_array( $body ) && isset( $body['next_checkin_seconds'] ) && is_int( $body['next_checkin_seconds'] ) ) {
-			$secs = max( ZS_FLEET_UE_INTERVAL_MIN, min( ZS_FLEET_UE_INTERVAL_MAX, $body['next_checkin_seconds'] ) );
-			if ( $secs !== zs_fleet_ue_desired_interval() ) {
-				update_option( ZS_FLEET_UE_OPT_INTERVAL, $secs, false );
-				// Apply immediately so the next pull lands on the new cadence rather
-				// than waiting for the following init.
-				zs_fleet_ue_schedule();
-			}
+	$body = json_decode( (string) wp_remote_retrieve_body( $resp ), true );
+	if ( is_array( $body ) && isset( $body['next_checkin_seconds'] ) && is_int( $body['next_checkin_seconds'] ) ) {
+		$secs = max( ZS_FLEET_UE_INTERVAL_MIN, min( ZS_FLEET_UE_INTERVAL_MAX, $body['next_checkin_seconds'] ) );
+		if ( $secs !== zs_fleet_ue_desired_interval() ) {
+			update_option( ZS_FLEET_UE_OPT_INTERVAL, $secs, false );
+			// Apply immediately so the next pull lands on the new cadence rather
+			// than waiting for the following init.
+			zs_fleet_ue_schedule();
 		}
 	}
 }
@@ -1516,6 +1626,43 @@ function zs_fleet_ue_cron_run() {
 		return;
 	}
 	set_transient( ZS_FLEET_UE_LOCK, 1, 10 * MINUTE_IN_SECONDS );
+
+	// Fatal-safety net: a PHP fatal inside Plugin_Upgrader (OOM, timeout, a plugin's
+	// own load error) does NOT run the try/finally below — but it DOES fire shutdown
+	// functions. Without this, the lock would sit until its 10-min TTL and strand the
+	// next cron cycle. Release the lock and drop a durable breadcrumb so the failure
+	// is visible and the fleet keeps moving. No-ops on the normal path via the flag.
+	$zs_lock_released = false;
+	register_shutdown_function(
+		function () use ( &$zs_lock_released ) {
+			if ( $zs_lock_released ) {
+				return; // normal completion already cleaned up in finally.
+			}
+			$err = error_get_last();
+			$is_fatal = is_array( $err ) && in_array(
+				$err['type'],
+				array( E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR ),
+				true
+			);
+			if ( ! $is_fatal ) {
+				return;
+			}
+			delete_transient( ZS_FLEET_UE_LOCK );
+			update_option(
+				'zs_fleet_ue_restore_pending',
+				array(
+					'slug'  => '(unknown)',
+					'kind'  => 'fatal_during_cron',
+					'stash' => '',
+					'at'    => gmdate( 'c' ),
+					'error' => isset( $err['message'] ) ? substr( (string) $err['message'], 0, 500 ) : '',
+				),
+				false
+			);
+			error_log( '[zs-fleet] CRITICAL fatal during engine cron at ' . home_url() . ': ' . ( isset( $err['message'] ) ? $err['message'] : 'unknown' ) );
+		}
+	);
+
 	try {
 		$env = zs_fleet_ue_pull_envelope();
 		if ( is_wp_error( $env ) ) {
@@ -1537,6 +1684,7 @@ function zs_fleet_ue_cron_run() {
 		zs_fleet_ue_checkin( $report );
 	} finally {
 		delete_transient( ZS_FLEET_UE_LOCK );
+		$zs_lock_released = true; // tell the shutdown net the normal path handled cleanup.
 	}
 }
 

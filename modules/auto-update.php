@@ -48,11 +48,21 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 const ZS_FLEET_AU_ZIP_URL     = 'https://github.com/marcorubiol/zs-core/releases/latest/download/zs-fleet.zip';
+// Detached Ed25519 signature of the exact release zip, published as a sibling
+// release asset (base64 of the 64-byte signature). See deploy/sign-release.php.
+const ZS_FLEET_AU_SIG_URL     = ZS_FLEET_AU_ZIP_URL . '.sig';
 const ZS_FLEET_AU_HOOK        = 'zs_fleet_auto_update_check';
 const ZS_FLEET_AU_OPT_LAST    = 'zs_fleet_au_last_check';
 const ZS_FLEET_AU_OPT_SUCCESS = 'zs_fleet_au_last_success';
 const ZS_FLEET_AU_OPT_ERROR   = 'zs_fleet_au_last_error';
 const ZS_FLEET_AU_LOCK        = 'zs_fleet_au_lock';
+
+// Optional shared secret for the on-demand trigger (GET /?zs_fleet_check_now=1&zs_fleet_secret=…).
+// Override in wp-config.php to let an unauthenticated CI/push script fire the check;
+// empty → the trigger requires a logged-in manage_options operator instead.
+if ( ! defined( 'ZS_FLEET_AU_TRIGGER_SECRET' ) ) {
+	define( 'ZS_FLEET_AU_TRIGGER_SECRET', '' );
+}
 
 add_action( 'init', 'zs_fleet_au_schedule' );
 add_action( 'init', 'zs_fleet_au_handle_push_trigger', 5 );
@@ -66,12 +76,13 @@ add_action( ZS_FLEET_AU_HOOK, 'zs_fleet_au_run' );
  * After tagging a new version, hit this URL on each fleet site —
  * within seconds the site downloads, compares, and swaps.
  *
- * Why no auth: the work this triggers is idempotent (download +
- * version-compare + maybe rename). If the version on disk already
- * matches the latest release, the downloaded zip is discarded — no
- * state change. The internal transient lock caps one real execution
- * per 5 minutes per site, so the worst an attacker can do is
- * waste ~12 KB of GitHub bandwidth per 5 minutes per site.
+ * Auth: the swap itself is now signature-gated (fail-closed — see
+ * zs_fleet_au_verify_zip_signature), so the trigger is not an RCE
+ * vector. But an open trigger still lets anyone force the
+ * download/compare cycle and hammer GitHub, so we gate it: a
+ * logged-in manage_options operator, OR a matching shared secret
+ * (?zs_fleet_secret=…, constant-time compared). Anything else → 403.
+ * The internal 5-minute transient lock still caps real executions.
  *
  * Output is plain text so a shell script can grep the result:
  *
@@ -82,6 +93,13 @@ add_action( ZS_FLEET_AU_HOOK, 'zs_fleet_au_run' );
 function zs_fleet_au_handle_push_trigger() {
 	if ( ! isset( $_GET['zs_fleet_check_now'] ) ) {
 		return;
+	}
+	if ( ! zs_fleet_au_trigger_authorized() ) {
+		status_header( 403 );
+		nocache_headers();
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		echo "forbidden\n";
+		exit;
 	}
 	if ( ! apply_filters( 'zs_fleet_auto_update_enabled', true ) ) {
 		status_header( 403 );
@@ -117,6 +135,26 @@ function zs_fleet_au_handle_push_trigger() {
 		echo "last_error:     {$err['msg']}\n";
 	}
 	exit;
+}
+
+/**
+ * Authorize the on-demand trigger: a logged-in manage_options operator, or a
+ * matching shared secret (constant-time compared). No secret configured → only
+ * logged-in operators. Never leaks timing about the secret via hash_equals.
+ */
+function zs_fleet_au_trigger_authorized() {
+	if ( function_exists( 'current_user_can' ) && current_user_can( 'manage_options' ) ) {
+		return true;
+	}
+	$secret = defined( 'ZS_FLEET_AU_TRIGGER_SECRET' ) ? (string) ZS_FLEET_AU_TRIGGER_SECRET : '';
+	if ( $secret === '' ) {
+		return false;
+	}
+	$given = isset( $_GET['zs_fleet_secret'] ) ? (string) wp_unslash( $_GET['zs_fleet_secret'] ) : '';
+	if ( $given === '' ) {
+		return false;
+	}
+	return hash_equals( $secret, $given );
 }
 
 function zs_fleet_au_schedule() {
@@ -188,6 +226,28 @@ function zs_fleet_au_check_and_apply() {
 		return new WP_Error( 'download_http', "zip download HTTP {$code}" );
 	}
 
+	// ── Release signature gate (fail-closed) ──────────────────────────────────
+	// Verify a detached Ed25519 signature over the EXACT downloaded zip bytes
+	// BEFORE we ever unzip / extract / swap. This is what turns a blind
+	// "fetch code from a URL and run it" into a verified self-update. Reuses the
+	// manifest keypair (ZS_FLEET_UE_PUBKEY, defined in update-engine.php): the
+	// private key lives only in the control-plane Worker; releases are signed
+	// locally at release time (deploy/sign-release.php) and the .sig published as
+	// a release asset. Domain-separated ("ZS-FLEET-RELEASE"\0) so a manifest
+	// signature can never be replayed as a release signature or vice-versa.
+	//
+	// Backward-compat reality: the CURRENTLY-live engine performs the download for
+	// the NEXT update, so this gate only protects updates issued AFTER a
+	// sig-checking build (v0.3.x) is live. Once the fleet runs this version, EVERY
+	// release MUST ship a valid .sig or the fleet stops self-updating — fails
+	// closed, by design.
+	$sig_check = zs_fleet_au_verify_zip_signature( $tmp_zip );
+	if ( is_wp_error( $sig_check ) ) {
+		@unlink( $tmp_zip );
+		error_log( '[zs-fleet] CRITICAL: release signature verification FAILED - refusing self-update (' . $sig_check->get_error_message() . ')' );
+		return $sig_check;
+	}
+
 	$tmp_dir = trailingslashit( get_temp_dir() ) . 'zs-fleet-check-' . uniqid();
 	if ( ! mkdir( $tmp_dir, 0755, true ) ) {
 		@unlink( $tmp_zip );
@@ -237,6 +297,62 @@ function zs_fleet_au_check_and_apply() {
 	zs_fleet_au_rrmdir( $tmp_dir );
 
 	return $remote_version;
+}
+
+/**
+ * Verify the detached Ed25519 signature of a downloaded release zip. FAIL-CLOSED:
+ * returns WP_Error (never swaps) on ANY doubt — sodium missing, no/empty pubkey,
+ * malformed key, sig download != 200, malformed sig, or a verify miss.
+ *
+ * Message is domain-separated over the raw zip bytes:
+ *   "ZS-FLEET-RELEASE" . chr(0) . sha256(zip_bytes, raw)
+ * matching deploy/sign-release.php and the control-plane signer.
+ *
+ * @param string $zip_path absolute path to the downloaded zip on disk.
+ * @return true|WP_Error
+ */
+function zs_fleet_au_verify_zip_signature( $zip_path ) {
+	if ( ! function_exists( 'sodium_crypto_sign_verify_detached' ) ) {
+		return new WP_Error( 'sig_verify', 'libsodium unavailable — refusing unsigned self-update' );
+	}
+	// Reuse the engine's release/manifest public key. Do NOT hardcode a second copy.
+	if ( ! defined( 'ZS_FLEET_UE_PUBKEY' ) || ZS_FLEET_UE_PUBKEY === '' ) {
+		return new WP_Error( 'sig_verify', 'no release public key configured (ZS_FLEET_UE_PUBKEY)' );
+	}
+	$pubkey = base64_decode( ZS_FLEET_UE_PUBKEY, true );
+	if ( $pubkey === false || strlen( $pubkey ) !== SODIUM_CRYPTO_SIGN_PUBLICKEYBYTES ) {
+		return new WP_Error( 'sig_verify', 'release public key malformed' );
+	}
+
+	$sig_resp = wp_remote_get(
+		ZS_FLEET_AU_SIG_URL,
+		array(
+			'timeout'     => 30,
+			'redirection' => 5,
+			'headers'     => array( 'User-Agent' => 'zs-fleet auto-updater (sig)' ),
+		)
+	);
+	if ( is_wp_error( $sig_resp ) ) {
+		return new WP_Error( 'sig_verify', 'signature download error: ' . $sig_resp->get_error_message() );
+	}
+	if ( (int) wp_remote_retrieve_response_code( $sig_resp ) !== 200 ) {
+		return new WP_Error( 'sig_verify', 'signature download HTTP ' . wp_remote_retrieve_response_code( $sig_resp ) );
+	}
+	$sig = base64_decode( trim( (string) wp_remote_retrieve_body( $sig_resp ) ), true );
+	if ( $sig === false || strlen( $sig ) !== SODIUM_CRYPTO_SIGN_BYTES ) {
+		return new WP_Error( 'sig_verify', 'signature malformed' );
+	}
+
+	$zip_bytes = @file_get_contents( $zip_path );
+	if ( $zip_bytes === false || $zip_bytes === '' ) {
+		return new WP_Error( 'sig_verify', 'could not read downloaded zip for hashing' );
+	}
+	$message = 'ZS-FLEET-RELEASE' . chr( 0 ) . hash( 'sha256', $zip_bytes, true );
+
+	if ( sodium_crypto_sign_verify_detached( $sig, $message, $pubkey ) !== true ) {
+		return new WP_Error( 'sig_verify', 'signature does not match downloaded zip' );
+	}
+	return true;
 }
 
 function zs_fleet_au_read_version( $bootstrap_path ) {

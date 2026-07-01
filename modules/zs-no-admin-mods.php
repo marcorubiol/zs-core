@@ -178,9 +178,50 @@ function zs_no_admin_mods_exempt_emails() {
 }
 
 /**
- * Return true if the currently logged-in user is one of the operator
- * accounts in the email whitelist. When true, the capability filter
- * lets the user through; any other admin still hits do_not_allow.
+ * One-time seed of the operator user-ID binding.
+ *
+ * The email whitelist ALONE is mintable: a client admin who can create users
+ * (create_users/edit_users stay allowed by design) could add an account with an
+ * operator email and inherit the exemption. Binding the exemption to the stable
+ * per-site user IDs that ALREADY held an operator email at seed time closes that
+ * — a freshly-minted user with the same email gets a different ID and is not
+ * exempt.
+ *
+ * Stored as an autoloaded option (+ a 'seeded' sentinel) so we scan the user
+ * table exactly once, not on every request. An empty result is valid (no operator
+ * user on this site) — we still record the sentinel and grant NO browser exemption
+ * (fail-closed; WP-CLI / cron / MainWP remain the legit channels).
+ *
+ * Residual seed-timing window: an attacker who mints the operator email on a
+ * brand-new site BEFORE this first seed runs would be captured as "the" operator.
+ * In practice the operator provisions the site (and this MU-plugin) before any
+ * client account exists, so the first pageload seeds the real IDs. Still strictly
+ * better than the pure-email check it replaces.
+ */
+function zs_no_admin_mods_seed_operator_ids() {
+	if ( get_option( 'zs_nam_operator_ids_seeded' ) ) {
+		return;
+	}
+	if ( ! function_exists( 'get_user_by' ) ) {
+		return; // pluggable not ready yet — try again next request.
+	}
+	$ids = array();
+	foreach ( zs_no_admin_mods_exempt_emails() as $email ) {
+		$u = get_user_by( 'email', $email );
+		if ( $u && ! empty( $u->ID ) ) {
+			$ids[] = (int) $u->ID;
+		}
+	}
+	update_option( 'zs_nam_operator_ids', $ids, true );
+	update_option( 'zs_nam_operator_ids_seeded', 1, true );
+}
+add_action( 'init', 'zs_no_admin_mods_seed_operator_ids' );
+
+/**
+ * Return true if the current user is a bound operator: their stable per-site ID
+ * was captured at seed time AND their email is still whitelisted. The ID binding
+ * is the real gate (defeats a minted-email account); the email is a second factor.
+ * Empty binding → NO exemption (fail-closed).
  */
 function zs_no_admin_mods_is_exempt_user() {
 	if ( ! function_exists( 'wp_get_current_user' ) ) {
@@ -188,6 +229,13 @@ function zs_no_admin_mods_is_exempt_user() {
 	}
 	$user = wp_get_current_user();
 	if ( ! $user || empty( $user->ID ) ) {
+		return false;
+	}
+	$operator_ids = get_option( 'zs_nam_operator_ids', array() );
+	if ( ! is_array( $operator_ids ) || $operator_ids === array() ) {
+		return false; // not seeded yet, or no operator user existed → fail-closed.
+	}
+	if ( ! in_array( (int) $user->ID, array_map( 'intval', $operator_ids ), true ) ) {
 		return false;
 	}
 	$email = strtolower( (string) $user->user_email );
