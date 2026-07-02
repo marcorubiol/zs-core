@@ -26,9 +26,15 @@
  * differs). Download the published zs-fleet.zip from the GitHub release, sign THAT
  * file, then upload the resulting zs-fleet.zip.sig as an additional asset.
  *
- * ZS_RELEASE_SIGNING_SK accepts either:
- *   - a 64-byte crypto_sign secret key (base64), or
- *   - a 32-byte seed (base64) — the keypair is derived from it.
+ * ZS_RELEASE_SIGNING_SK accepts any of:
+ *   - a 64-byte libsodium crypto_sign secret key (base64), or
+ *   - a 32-byte seed (base64) — the keypair is derived from it, or
+ *   - a 48-byte PKCS8 DER key (base64) — the exact format `wrangler secret put
+ *     FLEET_SIGNING_KEY` holds and scripts/genkey.mjs's `private_pkcs8_b64`
+ *     produces (Web Crypto's native Ed25519 export). Ed25519 PKCS8 has a fixed
+ *     16-byte ASN.1 prefix (RFC 8410) followed by the raw 32-byte seed, so this
+ *     script validates that prefix and extracts the seed from it — the Worker
+ *     secret can be used here as-is, no manual conversion needed.
  * The private key is NEVER printed and is zeroed from memory after signing.
  */
 
@@ -60,7 +66,19 @@ if ( $sk_raw === false ) {
 	exit( 1 );
 }
 
-if ( strlen( $sk_raw ) === SODIUM_CRYPTO_SIGN_SEEDBYTES ) {
+// RFC 8410 fixed prefix for a Web-Crypto-exported Ed25519 PKCS8 private key
+// (version INTEGER 0, AlgorithmIdentifier OID 1.3.101.112, OCTET STRING wrapper).
+// Ed25519 PKCS8 has no variable-length fields, so this prefix is constant.
+const PKCS8_ED25519_PREFIX = "\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20";
+
+if ( strlen( $sk_raw ) === 48 && substr( $sk_raw, 0, 16 ) === PKCS8_ED25519_PREFIX ) {
+	$seed = substr( $sk_raw, 16, 32 );
+	$kp   = sodium_crypto_sign_seed_keypair( $seed );
+	$sk   = sodium_crypto_sign_secretkey( $kp );
+	$pk   = sodium_crypto_sign_publickey( $kp );
+	sodium_memzero( $seed );
+	sodium_memzero( $kp );
+} elseif ( strlen( $sk_raw ) === SODIUM_CRYPTO_SIGN_SEEDBYTES ) {
 	$kp = sodium_crypto_sign_seed_keypair( $sk_raw );
 	$sk = sodium_crypto_sign_secretkey( $kp );
 	$pk = sodium_crypto_sign_publickey( $kp );
@@ -69,7 +87,7 @@ if ( strlen( $sk_raw ) === SODIUM_CRYPTO_SIGN_SEEDBYTES ) {
 	$sk = $sk_raw;
 	$pk = sodium_crypto_sign_publickey_from_secretkey( $sk );
 } else {
-	fwrite( STDERR, "sign-release.php: signing key must be a 32-byte seed or 64-byte secret key (got " . strlen( $sk_raw ) . " bytes)\n" );
+	fwrite( STDERR, "sign-release.php: signing key must be a 32-byte seed, a 48-byte PKCS8 key, or a 64-byte secret key (got " . strlen( $sk_raw ) . " bytes)\n" );
 	sodium_memzero( $sk_raw );
 	exit( 1 );
 }
