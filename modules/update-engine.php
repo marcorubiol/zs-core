@@ -48,7 +48,7 @@ if ( ! defined( 'ZS_FLEET_UE_PUBKEY' ) ) {
 	// base64 raw Ed25519 public key of the fleet control-plane. Fleet-wide; the
 	// matching private key lives only in the Worker (fleet-control). A wrong/empty
 	// key just makes every manifest fail verification — fail-safe.
-	define( 'ZS_FLEET_UE_PUBKEY', '01Wl/1uROuecwc2i8QERW+hKJQfiDGHKx54qTWAraOg=' );
+	define( 'ZS_FLEET_UE_PUBKEY', '06rE21riRo7ZqmAQd7dTrg+9zrXPw652OFK1yTEVbUE=' );
 }
 if ( ! defined( 'ZS_FLEET_UE_CONTROL_URL' ) ) {
 	// Control-plane base URL (no trailing slash). Fleet-wide endpoint.
