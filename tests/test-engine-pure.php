@@ -336,5 +336,77 @@ foreach ( array( 'AUTO_INCREMENT', 'TABLE_ROWS', 'DATA_LENGTH', 'CARDINALITY' ) 
 	check( strpos( $ue_sql, $banned ) === false, "schema_signature SELECT excludes volatile column $banned" );
 }
 
+/* ── ONBOARD mode: shape validation (fixed-verb ritual) ──────────────────── */
+$onboard = array(
+	'manifest_version' => 1,
+	'site'             => 'a.com',
+	'expires_at'       => '2026-01-01T00:00:00Z',
+	'nonce'            => 'n-onb',
+	'mode'             => 'onboard',
+	'updates'          => array(
+		array(
+			'action'           => 'flowguard',
+			'artifact_version' => '1.2.0',
+			'artifact_sha256'  => str_repeat( 'a', 64 ),
+		),
+	),
+);
+check( zs_fleet_ue_validate_shape( $onboard ) === '', 'onboard manifest passes shape (action + artifact pin)' );
+
+$t = $onboard;
+$t['updates'][0]['action'] = 'rm-rf'; // not in the compiled allowlist
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'onboard action outside allowlist rejected' );
+
+$t = $onboard;
+$t['updates'][0]['artifact_sha256'] = 'deadbeef'; // not 64-hex
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'onboard short/bad sha256 rejected' );
+
+$t = $onboard;
+$t['updates'][0]['artifact_sha256'] = str_repeat( 'A', 64 ); // uppercase — must be lowercase hex
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'onboard non-lowercase sha256 rejected' );
+
+$t = $onboard;
+unset( $t['updates'][0]['artifact_version'] );
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'onboard missing artifact_version rejected' );
+
+$t = $onboard;
+$t['updates'] = array();
+check( zs_fleet_ue_validate_shape( $t ) !== '', 'onboard empty updates rejected' );
+
+// An onboard item MUST NOT be forced through the plugin/theme (type+slug) loop: a
+// URL/slug in the item is simply ignored, and a bare fixed-verb item is valid.
+$t = $onboard;
+$t['updates'][0]['slug'] = '../evil'; // would fail the plugin loop; onboard ignores it
+check( zs_fleet_ue_validate_shape( $t ) === '', 'onboard does not fall through to plugin|theme slug validation' );
+
+// onboard must not require type/slug/from/to (proves the early-return branch).
+check( ! isset( $onboard['updates'][0]['type'] ) && zs_fleet_ue_validate_shape( $onboard ) === '', 'onboard item needs no type/slug/from/to' );
+
+/* ── ONBOARD sealed-secret format (byte-exact PyNaCl contract) ────────────── */
+check(
+	zs_fleet_ue_onboard_plaintext( 'admin', 'uuid-1', 'ab cd ef gh' ) === "admin\nuuid-1\nabcdefgh",
+	'sealed plaintext = user\\nuuid\\npassword with spaces stripped'
+);
+
+// Round-trip through the ACTUAL sealed-box primitive the operator's PyNaCl SealedBox
+// implements — seal to a box public key, open with the keypair, split on "\n".
+$bkp    = sodium_crypto_box_keypair();
+$bpk    = sodium_crypto_box_publickey( $bkp );
+$pt     = zs_fleet_ue_onboard_plaintext( 'admin', 'uuid-9', 'AAAA BBBB CCCC' );
+$sealed = base64_encode( sodium_crypto_box_seal( $pt, $bpk ) );
+$opened = sodium_crypto_box_seal_open( base64_decode( $sealed, true ), $bkp );
+check( is_string( $opened ) && $opened === $pt, 'sealed box round-trips to identical plaintext' );
+$parts = explode( "\n", (string) $opened );
+check(
+	count( $parts ) === 3 && $parts[0] === 'admin' && $parts[1] === 'uuid-9' && $parts[2] === 'AAAABBBBCCCC',
+	'unsealed splits into [user, uuid, password]'
+);
+
+/* ── ONBOARD constants: fail-closed defaults ─────────────────────────────── */
+check( ZS_FLEET_UE_ALLOW_ONBOARD === false, 'onboard opt-in defaults to false (fail-closed)' );
+check( ZS_FLEET_UE_SEAL_PUBKEY !== '' && strlen( (string) base64_decode( ZS_FLEET_UE_SEAL_PUBKEY, true ) ) === 32, 'seal pubkey baked as a valid 32-byte X25519 key (fail-closed on empty lives in the handler)' );
+check( is_array( ZS_FLEET_UE_ONBOARD_ACTIONS ) && ZS_FLEET_UE_ONBOARD_ACTIONS === array( 'flowguard' ), 'onboard action allowlist = [flowguard]' );
+check( ZS_FLEET_UE_ARTIFACT_MAX === 20971520, 'artifact size cap = 20 MiB' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );

@@ -74,11 +74,44 @@ if ( ! defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ) {
 	define( 'ZS_FLEET_UE_HEALTH_EXPECT', 200 );
 }
 
+/* ── Onboard mode (FlowGuard web-onboarding, Fleet v2) ───────────────────────
+ * All FAIL-CLOSED if unset and wp-config-overridable, matching the constants
+ * above. The `onboard` manifest mode is a FIXED-VERB ritual: the item carries an
+ * `action` from a compiled-in allowlist + a pinned artifact hash — never a slug
+ * or a URL — so a compromised control-plane can only ever trigger the ONE ritual
+ * the engine already knows, not arbitrary code. Full spec:
+ *   03_AGENCY/Fleet/_notes/spec-fleet-flowguard-web-onboard.md
+ */
+if ( ! defined( 'ZS_FLEET_UE_ONBOARD_ACTIONS' ) ) {
+	// Compiled-in allowlist of onboard verbs. The manifest's action MUST be one of
+	// these; anything else fails shape validation. Fixed, not manifest-driven.
+	define( 'ZS_FLEET_UE_ONBOARD_ACTIONS', array( 'flowguard' ) );
+}
+if ( ! defined( 'ZS_FLEET_UE_ALLOW_ONBOARD' ) ) {
+	// Per-site opt-in (wp-config constant — chosen so a control-plane compromise
+	// cannot flip it). Default false → an onboard manifest resolves to 'skipped'.
+	define( 'ZS_FLEET_UE_ALLOW_ONBOARD', false );
+}
+if ( ! defined( 'ZS_FLEET_UE_SEAL_PUBKEY' ) ) {
+	// base64 X25519 (crypto_box) PUBLIC key of the OPERATOR — the only party that
+	// can unseal a minted app-password. The Worker never holds the private half
+	// (blind messenger). Empty → the engine cannot seal → cannot mint → onboard
+	// resolves to 'error' ('no seal pubkey'). Set per-site at enrollment.
+	define( 'ZS_FLEET_UE_SEAL_PUBKEY', '6NjAm65VSs/MsElywzIxY1OJCVW131Tdv28wmgdULyg=' );
+}
+if ( ! defined( 'ZS_FLEET_UE_ARTIFACT_MAX' ) ) {
+	// Hard cap on the fetched FlowGuard artifact (bytes). 20 MiB. A larger download
+	// is rejected before install (disk + hostile-blob defense; hash is the integrity
+	// gate, this is the size gate).
+	define( 'ZS_FLEET_UE_ARTIFACT_MAX', 20971520 );
+}
+
 const ZS_FLEET_UE_HOOK          = 'zs_fleet_ue_pull';
 const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue_lock';
 const ZS_FLEET_UE_OPT_NONCES    = 'zs_fleet_ue_consumed_nonces'; // replay guard
 const ZS_FLEET_UE_OPT_REPORT    = 'zs_fleet_ue_last_report';
 const ZS_FLEET_UE_OPT_UNACKED   = 'zs_fleet_ue_unacked_report';  // last report not yet 2xx-acked by the control-plane
+const ZS_FLEET_UE_OPT_ONBOARD_UNACKED = 'zs_fleet_ue_onboard_unacked'; // sealed onboard secret not yet 2xx-acked (ciphertext ONLY, never plaintext)
 const ZS_FLEET_UE_OPT_INTERVAL  = 'zs_fleet_ue_interval';        // control-plane-driven check-in cadence (seconds)
 const ZS_FLEET_UE_SCHEDULE      = 'zs_fleet_ue';                 // custom cron schedule name (interval = the option above)
 const ZS_FLEET_UE_INTERVAL_MIN  = 300;                           // 5 min floor
@@ -141,12 +174,42 @@ function zs_fleet_ue_validate_shape( $m ) {
 	if ( (int) $m['manifest_version'] !== 1 ) {
 		return 'unsupported manifest_version';
 	}
-	if ( ! in_array( $m['mode'], array( 'shadow', 'apply', 'rollback' ), true ) ) {
+	if ( ! in_array( $m['mode'], array( 'shadow', 'apply', 'rollback', 'onboard' ), true ) ) {
 		return 'invalid mode';
 	}
 	if ( ! is_array( $m['updates'] ) ) {
 		return 'updates not a list';
 	}
+
+	// ── ONBOARD: a FIXED-VERB ritual, validated in isolation and RETURNED here so it
+	// never falls through to the plugin|theme loop below. Item = { action ∈ compiled
+	// allowlist, artifact_version, artifact_sha256 } — NO slug, NO type, NO URL. The
+	// signed artifact_sha256 is what the engine pins the download to; the action is
+	// the only lever, and it is bounded to what the engine already knows how to do.
+	if ( $m['mode'] === 'onboard' ) {
+		if ( count( $m['updates'] ) === 0 ) {
+			return 'onboard: empty updates';
+		}
+		$allow = defined( 'ZS_FLEET_UE_ONBOARD_ACTIONS' ) ? ZS_FLEET_UE_ONBOARD_ACTIONS : array();
+		if ( ! is_array( $allow ) ) {
+			$allow = array();
+		}
+		foreach ( $m['updates'] as $i => $u ) {
+			foreach ( array( 'action', 'artifact_version', 'artifact_sha256' ) as $k ) {
+				if ( ! isset( $u[ $k ] ) || ! is_string( $u[ $k ] ) || $u[ $k ] === '' ) {
+					return "onboard update[{$i}] missing/invalid: {$k}";
+				}
+			}
+			if ( ! in_array( $u['action'], $allow, true ) ) {
+				return "onboard update[{$i}] action not in allowlist: {$u['action']}";
+			}
+			if ( preg_match( '/^[a-f0-9]{64}$/', $u['artifact_sha256'] ) !== 1 ) {
+				return "onboard update[{$i}] artifact_sha256 not 64-hex";
+			}
+		}
+		return '';
+	}
+
 	// A rollback item is minimal — { type, slug } only; the engine restores the
 	// most recent stash and ignores from/to. Apply/shadow still require from/to.
 	$required = ( $m['mode'] === 'rollback' )
@@ -1233,6 +1296,623 @@ function zs_fleet_ue_rollback_one_theme( $update ) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ * ONBOARD MODE — engine-driven web-onboarding of FlowGuard (Fleet v2).
+ *
+ * A FIXED-VERB ritual: fetch a hash-pinned artifact, install + activate via
+ * WP-core (running FlowGuard's Activator behind the engine's health gate),
+ * configure it (auto-run OFF so the engine keeps sole ownership of rollback,
+ * seed the "Fleet smoke" baseline flow), mint a WP Application Password, SEAL it
+ * to the operator's X25519 public key (crypto_box_seal — the Worker is a blind
+ * messenger), and deliver the sealed blob on a dedicated channel with durable
+ * retry. Plaintext credentials NEVER touch a report/inventory/option/log.
+ *
+ * Full spec + adversarial must-fixes (B1/M1..M5, m1/m2):
+ *   03_AGENCY/Fleet/_notes/spec-fleet-flowguard-web-onboard.md
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Byte-exact sealed-secret plaintext (PURE). MUST match the operator's PyNaCl
+ * split — `SealedBox(...).decrypt(...).split("\n") -> [user, uuid, app_password]`.
+ * The app-password's display spaces are stripped (WP accepts the compact form).
+ */
+function zs_fleet_ue_onboard_plaintext( $user, $uuid, $app_password ) {
+	return (string) $user . "\n" . (string) $uuid . "\n" . str_replace( ' ', '', (string) $app_password );
+}
+
+/**
+ * Zip-slip / layout guard (returns '' if OK, else WP_Error): the artifact must be
+ * exactly one top dir '<slug>/' containing '<slug>/<slug>.php', with no entry that
+ * escapes the prefix or traverses (../, absolute, backslash).
+ */
+function zs_fleet_ue_onboard_zip_layout_ok( $zip_path, $slug ) {
+	if ( ! class_exists( 'ZipArchive' ) ) {
+		return new WP_Error( 'no_zip', 'ZipArchive unavailable' );
+	}
+	$za = new ZipArchive();
+	if ( $za->open( $zip_path ) !== true ) {
+		return new WP_Error( 'zip_open', 'cannot open artifact zip' );
+	}
+	$prefix   = $slug . '/';
+	$has_main = false;
+	for ( $i = 0; $i < $za->numFiles; $i++ ) {
+		$name = $za->getNameIndex( $i );
+		if ( ! is_string( $name ) || $name === '' ) {
+			$za->close();
+			return new WP_Error( 'zip_entry', 'unreadable zip entry' );
+		}
+		$norm = str_replace( '\\', '/', $name );
+		if ( $norm[0] === '/' || strpos( $norm, '../' ) !== false || strpos( $name, '..\\' ) !== false ) {
+			$za->close();
+			return new WP_Error( 'zip_slip', 'zip entry escapes: ' . $name );
+		}
+		if ( strpos( $norm, $prefix ) !== 0 ) {
+			$za->close();
+			return new WP_Error( 'zip_layout', 'zip entry outside ' . $prefix . ': ' . $name );
+		}
+		if ( $norm === $prefix . $slug . '.php' ) {
+			$has_main = true;
+		}
+	}
+	$za->close();
+	if ( ! $has_main ) {
+		return new WP_Error( 'zip_no_main', 'artifact missing ' . $prefix . $slug . '.php' );
+	}
+	return '';
+}
+
+/**
+ * Fetch the artifact from /v1/artifact/<action>, stream to a tempfile, cap its
+ * size, hash-verify (constant-time) against the manifest's pin, and layout-guard
+ * it. On ANY failure the tempfile is removed and a WP_Error returned — INSTALL
+ * NOTHING. Returns the absolute tempfile path on success (caller unlinks).
+ */
+function zs_fleet_ue_onboard_fetch_artifact( $action, $expected_sha, $slug ) {
+	if ( ZS_FLEET_UE_CONTROL_URL === '' ) {
+		return new WP_Error( 'no_control', 'no control-plane configured' );
+	}
+	$max = defined( 'ZS_FLEET_UE_ARTIFACT_MAX' ) ? (int) ZS_FLEET_UE_ARTIFACT_MAX : 20971520;
+
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	$tmp = wp_tempnam( 'zs-fleet-artifact-' . $action );
+	if ( ! $tmp ) {
+		return new WP_Error( 'no_tmp', 'cannot create tempfile' );
+	}
+
+	$url  = trailingslashit( ZS_FLEET_UE_CONTROL_URL ) . 'v1/artifact/' . rawurlencode( (string) $action );
+	$resp = wp_remote_get(
+		$url,
+		array(
+			'timeout'   => 60,
+			'stream'    => true,
+			'filename'  => $tmp,
+			'sslverify' => true, // TLS verified — the hash is the integrity gate, but never trust an unverified transport.
+			'headers'   => array(
+				'User-Agent'      => 'zs-fleet-engine/' . ( defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : '0' ),
+				'X-ZS-Site-Token' => ZS_FLEET_UE_SITE_TOKEN,
+			),
+		)
+	);
+	if ( is_wp_error( $resp ) ) {
+		@unlink( $tmp );
+		return $resp;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $resp );
+	if ( $code !== 200 ) {
+		@unlink( $tmp );
+		return new WP_Error( 'artifact_http', 'artifact HTTP ' . $code );
+	}
+	// Size gate. The WP HTTP API does not expose a hard mid-stream byte cap for a
+	// streamed download, so the file lands first and we reject it before any install
+	// touches it (bounded by this cap; the hash below is the real integrity gate).
+	clearstatcache( true, $tmp );
+	$size = @filesize( $tmp );
+	if ( $size === false || $size <= 0 || $size > $max ) {
+		@unlink( $tmp );
+		return new WP_Error( 'artifact_size', 'artifact size out of bounds: ' . var_export( $size, true ) );
+	}
+	// Hash-verify: constant-time compare against the SIGNED manifest's pin. A
+	// mismatch installs NOTHING.
+	$got = hash_file( 'sha256', $tmp );
+	if ( ! is_string( $got ) || ! hash_equals( strtolower( (string) $expected_sha ), strtolower( $got ) ) ) {
+		@unlink( $tmp );
+		return new WP_Error( 'artifact_hash', 'artifact sha256 mismatch — install nothing' );
+	}
+	$layout = zs_fleet_ue_onboard_zip_layout_ok( $tmp, $slug );
+	if ( is_wp_error( $layout ) ) {
+		@unlink( $tmp );
+		return $layout;
+	}
+	return $tmp;
+}
+
+/**
+ * Seed the "Fleet smoke" baseline flow. Dedupe by post_title (m2): UPDATE an
+ * existing flow rather than inserting a duplicate. `_flowguard_steps` is stored as
+ * a PHP ARRAY (M2) — byte-identical to onboard.py's `wp post meta update
+ * --format=json` result, NOT a JSON string. Returns the flow post ID (0 on fail).
+ */
+function zs_fleet_ue_onboard_seed_flow( $steps ) {
+	$title = 'Fleet smoke';
+	$existing = get_posts(
+		array(
+			'post_type'        => 'flowguard_flow',
+			'post_status'      => 'any',
+			'title'            => $title,
+			'posts_per_page'   => 1,
+			'fields'           => 'ids',
+			'no_found_rows'    => true,
+			'suppress_filters' => true,
+		)
+	);
+	if ( ! empty( $existing ) ) {
+		$fid = (int) $existing[0];
+	} else {
+		$fid = wp_insert_post(
+			array(
+				'post_type'   => 'flowguard_flow',
+				'post_status' => 'publish',
+				'post_title'  => $title,
+			),
+			true
+		);
+		if ( is_wp_error( $fid ) || ! $fid ) {
+			return 0;
+		}
+		$fid = (int) $fid;
+	}
+	// ARRAY, not a JSON string — matches onboard.py's proven shape (M2). We do NOT
+	// set _flowguard_status (onboard.py never did; the proven shape is the contract).
+	update_post_meta( $fid, '_flowguard_steps', $steps );
+	return $fid;
+}
+
+/** Lowest-ID administrator as a WP_User, or null if the site has none. */
+function zs_fleet_ue_onboard_lowest_admin() {
+	$ids = get_users(
+		array(
+			'role'    => 'administrator',
+			'orderby' => 'ID',
+			'order'   => 'ASC',
+			'number'  => 1,
+			'fields'  => 'ID',
+		)
+	);
+	if ( empty( $ids ) ) {
+		return null;
+	}
+	$u = get_user_by( 'id', (int) $ids[0] );
+	return ( $u instanceof WP_User ) ? $u : null;
+}
+
+/** The user's application-password record matching $name, or null. */
+function zs_fleet_ue_onboard_find_app_password( $user_id, $name ) {
+	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+		return null;
+	}
+	$pws = WP_Application_Passwords::get_user_application_passwords( (int) $user_id );
+	if ( ! is_array( $pws ) ) {
+		return null;
+	}
+	foreach ( $pws as $pw ) {
+		if ( isset( $pw['name'] ) && $pw['name'] === $name ) {
+			return $pw;
+		}
+	}
+	return null;
+}
+
+/** Delete every application-password named $name (rotate-in-place cleanup). */
+function zs_fleet_ue_onboard_strip_app_passwords( $user_id, $name ) {
+	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+		return;
+	}
+	$pws = WP_Application_Passwords::get_user_application_passwords( (int) $user_id );
+	if ( ! is_array( $pws ) ) {
+		return;
+	}
+	foreach ( $pws as $pw ) {
+		if ( isset( $pw['name'], $pw['uuid'] ) && $pw['name'] === $name ) {
+			WP_Application_Passwords::delete_application_password( (int) $user_id, $pw['uuid'] );
+		}
+	}
+}
+
+/**
+ * POST the sealed onboard secret to the dedicated channel. Body carries ONLY the
+ * non-plaintext context { site, app_password_uuid, app_password_user, sealed }.
+ * Returns true on a 2xx, false otherwise (caller persists for durable retry).
+ */
+function zs_fleet_ue_onboard_deliver( $sealed_b64, $uuid, $user ) {
+	if ( ZS_FLEET_UE_CONTROL_URL === '' || ZS_FLEET_UE_SITE_TOKEN === '' ) {
+		return false;
+	}
+	$resp = wp_remote_post(
+		trailingslashit( ZS_FLEET_UE_CONTROL_URL ) . 'v1/onboard-secret',
+		array(
+			'timeout' => 30,
+			'headers' => array(
+				'Content-Type'    => 'application/json',
+				'X-ZS-Site-Token' => ZS_FLEET_UE_SITE_TOKEN,
+			),
+			'body'    => wp_json_encode(
+				array(
+					'site'              => wp_parse_url( home_url(), PHP_URL_HOST ),
+					'app_password_uuid' => (string) $uuid,
+					'app_password_user' => (string) $user,
+					'sealed'            => (string) $sealed_b64,
+				)
+			),
+		)
+	);
+	if ( is_wp_error( $resp ) ) {
+		return false;
+	}
+	$code = (int) wp_remote_retrieve_response_code( $resp );
+	return ( $code >= 200 && $code < 300 );
+}
+
+/**
+ * Durable retry of a pending sealed onboard secret (the delivery net, decoupled
+ * from the manifest that minted it — M1). Runs every enrolled cron cycle until the
+ * control-plane 2xx-acks it; the stored blob holds ciphertext ONLY, never plaintext.
+ */
+function zs_fleet_ue_onboard_retry_delivery() {
+	$blob = get_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED, null );
+	if ( ! is_array( $blob ) || empty( $blob['sealed'] ) || empty( $blob['user'] ) ) {
+		return;
+	}
+	$ok = zs_fleet_ue_onboard_deliver(
+		(string) $blob['sealed'],
+		isset( $blob['uuid'] ) ? (string) $blob['uuid'] : '',
+		(string) $blob['user']
+	);
+	if ( $ok ) {
+		delete_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED );
+	}
+}
+
+/**
+ * The onboard ritual for FlowGuard. Strict order of operations (see spec):
+ *   opt-in → seal-key precondition → fetch+hash artifact → install+activate →
+ *   health-gate → configure (autorun-off read-after-write M3 · seed smoke flow M2 ·
+ *   is_ssl M5) → consume nonce (M1) → mint (rotate-in-place, M1 re-mint guard) →
+ *   seal → deliver (durable retry).
+ *
+ * $nonce is threaded from the manifest so it can be consumed at the M1 point —
+ * after install+health, BEFORE mint — so a crash during mint/deliver can never
+ * re-run this manifest and blindly rotate a possibly-delivered credential.
+ *
+ * The returned row carries ONLY non-secret fields. Plaintext is held for the
+ * shortest possible window (mint → seal) and memzero'd immediately after sealing.
+ */
+function zs_fleet_ue_onboard_flowguard( $update, $nonce = '' ) {
+	$action  = isset( $update['action'] ) ? (string) $update['action'] : '';
+	$version = isset( $update['artifact_version'] ) ? (string) $update['artifact_version'] : '';
+	$sha256  = isset( $update['artifact_sha256'] ) ? strtolower( (string) $update['artifact_sha256'] ) : '';
+
+	$row = array(
+		'type'              => 'onboard',
+		'action'            => $action,
+		'artifact_version'  => $version,
+		'outcome'           => 'error',
+		'installed_version' => '',
+		'autorun_off'       => null,
+		'flows_seeded'      => null,
+		'license'           => 'pending',
+		'uuid'              => '',
+		'user'              => '',
+		'http_after'        => null,
+		'fingerprint_ok'    => null,
+		'message'           => '',
+	);
+
+	// ── 1. Per-site opt-in. ──
+	if ( ! ( defined( 'ZS_FLEET_UE_ALLOW_ONBOARD' ) && ZS_FLEET_UE_ALLOW_ONBOARD ) ) {
+		$row['outcome'] = 'skipped';
+		$row['message'] = 'onboard not enabled on this site (ZS_FLEET_UE_ALLOW_ONBOARD false)';
+		return $row;
+	}
+
+	// ── Seal-key precondition: no operator public key ⇒ we could mint but never
+	// deliver ⇒ fail fast BEFORE any install; never mint a credential we cannot seal.
+	$seal_pub_b64 = defined( 'ZS_FLEET_UE_SEAL_PUBKEY' ) ? (string) ZS_FLEET_UE_SEAL_PUBKEY : '';
+	if ( $seal_pub_b64 === '' ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'no seal pubkey';
+		return $row;
+	}
+	if ( ! function_exists( 'sodium_crypto_box_seal' ) ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'libsodium sealed-box unavailable';
+		return $row;
+	}
+	$seal_pub = base64_decode( $seal_pub_b64, true );
+	if ( $seal_pub === false || strlen( $seal_pub ) !== SODIUM_CRYPTO_BOX_PUBLICKEYBYTES ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'seal pubkey malformed (expect base64 32-byte X25519)';
+		return $row;
+	}
+
+	// Defense in depth: action must be in the compiled allowlist (shape already gated).
+	$allow = defined( 'ZS_FLEET_UE_ONBOARD_ACTIONS' ) ? ZS_FLEET_UE_ONBOARD_ACTIONS : array();
+	if ( ! is_array( $allow ) || ! in_array( $action, $allow, true ) ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'action not in allowlist: ' . $action;
+		return $row;
+	}
+
+	$slug = 'flowguard'; // the ONE ritual's fixed plugin slug — never from the manifest.
+
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/misc.php';
+	require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+
+	// ── 2. Fetch + hash-verify the artifact. ──
+	zs_fleet_ue_raise_limits();
+	$fetched = zs_fleet_ue_onboard_fetch_artifact( $action, $sha256, $slug );
+	if ( is_wp_error( $fetched ) ) {
+		$row['outcome'] = 'error';
+		$row['message'] = 'artifact: ' . $fetched->get_error_message();
+		return $row;
+	}
+	$zip_path = $fetched;
+
+	// ── 3. Install (or reuse) + activate via WP-core (runs FlowGuard's Activator). ──
+	WP_Filesystem();
+	$already = zs_fleet_ue_resolve_plugin_file( $slug );
+	$pf      = $already;
+	if ( $already === '' ) {
+		$upgrader  = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
+		$installed = $upgrader->install( $zip_path );
+		if ( is_wp_error( $installed ) || $installed !== true ) {
+			@unlink( $zip_path );
+			$row['outcome']  = 'error';
+			$row['message'] .= 'install failed: ' . ( is_wp_error( $installed ) ? $installed->get_error_message() : 'upgrader returned non-true' ) . '. ';
+			return $row;
+		}
+		wp_clean_plugins_cache( false );
+		$pf = zs_fleet_ue_resolve_plugin_file( $slug );
+	} else {
+		$row['message'] .= 'flowguard already installed; activating existing. ';
+	}
+	@unlink( $zip_path ); // verified artifact no longer needed on disk.
+	if ( $pf === '' ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'flowguard not resolvable after install. ';
+		return $row;
+	}
+
+	// Fresh install MUST run FlowGuard's Activator (custom tables / cron / roles),
+	// so activate with hooks ($silent=false); a reuse re-activation must NOT re-run
+	// it. $silent = already-installed.
+	$act = activate_plugin( $pf, '', false, $already !== '' );
+	if ( is_wp_error( $act ) ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'activate failed: ' . $act->get_error_message() . '. ';
+		if ( $already === '' ) {
+			zs_fleet_ue_onboard_revert( $slug, $pf );
+		}
+		return $row;
+	}
+	$row['installed_version'] = zs_fleet_ue_disk_version( $pf );
+
+	// ── 4. Health gate: the site must still render after activation. ──
+	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
+	$fp_ok                      = zs_fleet_ue_fingerprint_ok( $body );
+	$row['http_after']          = $code;
+	$row['fingerprint_ok']      = $fp_ok;
+
+	if ( zs_fleet_ue_health_blocked( $code, $body ) ) {
+		// Edge challenge/auth/rate-limit → cannot verify. Leave files, escalate, NO mint.
+		$row['outcome']  = 'error';
+		$row['reason']   = 'health_probe_blocked';
+		$row['message'] .= 'CANNOT VERIFY onboard: health probe blocked (HTTP ' . (int) $code . '); left installed, no mint, operator must verify. ';
+		zs_fleet_ue_breadcrumb( $slug, 'onboard_health_probe_blocked', $row );
+		error_log( '[zs-fleet] CRITICAL onboard health_probe_blocked for ' . $slug . ' at ' . home_url() . ' (HTTP ' . (int) $code . ')' );
+		return $row;
+	}
+	if ( (int) $code !== (int) ZS_FLEET_UE_HEALTH_EXPECT || ! $fp_ok ) {
+		// Genuine breakage → revert the install (deactivate + remove files), no mint.
+		$row['outcome']  = 'error';
+		$row['message'] .= 'onboard health gate failed (HTTP ' . (int) $code . ', fingerprint ' . ( $fp_ok ? 'ok' : 'bad' ) . '); reverting. ';
+		deactivate_plugins( $pf, true );
+		if ( $already === '' ) {
+			zs_fleet_ue_onboard_revert( $slug, $pf );
+		}
+		return $row;
+	}
+
+	// ── 5a. Disable FlowGuard auto-run/rollback (M3): read-modify-write the WHOLE
+	// flowguard_settings option, then READ-AFTER-WRITE verify BOTH enabled flags are
+	// false. This is a SECURITY requirement (otherwise two owners of rollback); if it
+	// cannot be confirmed → 'degraded', do NOT report the site onboarded. ──
+	$s = get_option( 'flowguard_settings', array() );
+	if ( ! is_array( $s ) ) {
+		$s = array();
+	}
+	if ( ! isset( $s['auto_run'] ) || ! is_array( $s['auto_run'] ) ) {
+		$s['auto_run'] = array();
+	}
+	foreach ( array( 'plugin_updates', 'theme_updates' ) as $grp ) {
+		if ( ! isset( $s['auto_run'][ $grp ] ) || ! is_array( $s['auto_run'][ $grp ] ) ) {
+			$s['auto_run'][ $grp ] = array();
+		}
+		$s['auto_run'][ $grp ]['enabled']       = false;
+		$s['auto_run'][ $grp ]['auto_rollback'] = false;
+	}
+	update_option( 'flowguard_settings', $s );
+
+	// Bust both the individual-option and the alloptions bulk cache so the re-read is
+	// persisted truth (covers autoloaded + non-autoloaded + external object caches).
+	wp_cache_delete( 'flowguard_settings', 'options' );
+	wp_cache_delete( 'alloptions', 'options' );
+	$chk         = get_option( 'flowguard_settings', array() );
+	$autorun_off = is_array( $chk )
+		&& isset( $chk['auto_run']['plugin_updates']['enabled'], $chk['auto_run']['theme_updates']['enabled'] )
+		&& $chk['auto_run']['plugin_updates']['enabled'] === false
+		&& $chk['auto_run']['theme_updates']['enabled'] === false;
+	$row['autorun_off'] = $autorun_off;
+	if ( ! $autorun_off ) {
+		$row['outcome']  = 'degraded';
+		$row['message'] .= 'M3: could not confirm FlowGuard auto_run disabled (read-after-write) — NOT onboarding. ';
+		return $row;
+	}
+
+	// ── 5b. Seed the "Fleet smoke" baseline flow (M2 shape, m2 dedupe). ──
+	$home  = home_url( '/' );
+	$steps = array(
+		array(
+			'id'          => 'fleet_home_nav',
+			'type'        => 'navigate',
+			'name'        => '',
+			'selector'    => '',
+			'value'       => $home,
+			'description' => 'Fleet smoke: navigate home',
+			'options'     => array(),
+		),
+		array(
+			'id'          => 'fleet_home_visual',
+			'type'        => 'visualCheck',
+			'name'        => '',
+			'selector'    => '',
+			'value'       => '',
+			'description' => 'Fleet smoke: full-page visual check',
+			'options'     => array( 'fullPage' => true ),
+		),
+	);
+	$fid                 = zs_fleet_ue_onboard_seed_flow( $steps );
+	$row['flows_seeded'] = ( $fid > 0 );
+
+	// ── 5c. HTTPS visibility (M5): a WP Application Password is refused by Basic Auth
+	// when is_ssl() is false. Behind Cloudflare (TLS terminated at the edge) is_ssl()
+	// is false at origin unless wp-config honors HTTP_X_FORWARDED_PROTO. Verify what WP
+	// ITSELF will check at auth time BEFORE minting; if it can't see HTTPS, flag it and
+	// do NOT mint (a mint-unusable credential surfaced now, not weeks later in VRT). The
+	// nonce is deliberately NOT consumed here — a fixed wp-config lets the next cron
+	// finish, and re-running install (already-present) + configure is idempotent. ──
+	if ( ! is_ssl() ) {
+		$row['outcome']  = 'degraded';
+		$row['flag']     = 'app_password_unusable_no_https';
+		$row['message'] .= 'M5: WP does not see HTTPS (is_ssl() false) — an app-password would be refused; force HTTP_X_FORWARDED_PROTO in wp-config. Not minting. ';
+		return $row;
+	}
+
+	// ── 6. Consume the manifest nonce NOW (M1): install + health + configure are all
+	// done and verified. Burning the nonce here means a crash during mint/deliver can
+	// NEVER re-run this manifest and blindly rotate a delivered credential; delivery
+	// durability is handled separately by the unacked-blob retry. ──
+	if ( is_string( $nonce ) && $nonce !== '' ) {
+		zs_fleet_ue_consume_nonce( $nonce );
+	}
+
+	// ── 7. Mint. M1 re-mint guard: only mint a FRESH credential when neither a
+	// 'fleet-flowguard' app-password already exists NOR a sealed blob is pending
+	// delivery — never rotate a possibly-delivered credential blindly. ──
+	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'WP_Application_Passwords unavailable (WP < 5.6?). ';
+		return $row;
+	}
+	$admin = zs_fleet_ue_onboard_lowest_admin();
+	if ( ! $admin ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'no administrator to mint an app-password on. ';
+		return $row;
+	}
+
+	$app_name    = 'fleet-flowguard';
+	$existing_pw = zs_fleet_ue_onboard_find_app_password( $admin->ID, $app_name );
+	$unacked     = get_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED, null );
+	if ( $existing_pw !== null || is_array( $unacked ) ) {
+		// A credential is already minted (and possibly delivered) OR a sealed blob is
+		// still pending delivery. Do NOT rotate — the durable-retry path finishes any
+		// pending delivery. Report onboarded (site is configured) without a fresh mint.
+		$row['outcome'] = 'onboarded';
+		$row['user']    = $admin->user_login;
+		if ( is_array( $existing_pw ) && isset( $existing_pw['uuid'] ) ) {
+			$row['uuid'] = (string) $existing_pw['uuid'];
+		}
+		$row['message'] .= 'app-password already present — not rotated (M1); '
+			. ( is_array( $unacked ) ? 'delivery still pending. ' : 'previously delivered. ' );
+		return $row;
+	}
+
+	// Fresh mint. Rotate-in-place: strip any stale same-name password first (the M1
+	// guard above guarantees none, but this keeps the name unique defensively).
+	zs_fleet_ue_onboard_strip_app_passwords( $admin->ID, $app_name );
+	$created = WP_Application_Passwords::create_new_application_password(
+		$admin->ID,
+		array( 'name' => $app_name )
+	);
+	if ( is_wp_error( $created ) || ! is_array( $created ) || empty( $created[0] ) ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'app-password mint failed: ' . ( is_wp_error( $created ) ? $created->get_error_message() : 'unexpected return' ) . '. ';
+		return $row;
+	}
+	$plain_pw = (string) $created[0]; // the ONLY moment plaintext exists on-site.
+	$pw_item  = ( isset( $created[1] ) && is_array( $created[1] ) ) ? $created[1] : array();
+	$uuid     = isset( $pw_item['uuid'] ) ? (string) $pw_item['uuid'] : '';
+
+	// ── 8. Seal (byte-identical to the operator's PyNaCl unseal). ──
+	$plaintext  = zs_fleet_ue_onboard_plaintext( $admin->user_login, $uuid, $plain_pw );
+	$sealed_raw = sodium_crypto_box_seal( $plaintext, $seal_pub );
+	// Wipe plaintext from memory the moment it is sealed.
+	if ( function_exists( 'sodium_memzero' ) ) {
+		sodium_memzero( $plain_pw );
+		sodium_memzero( $plaintext );
+	} else {
+		$plain_pw  = '';
+		$plaintext = '';
+	}
+	if ( ! is_string( $sealed_raw ) || $sealed_raw === '' ) {
+		$row['outcome']  = 'error';
+		$row['message'] .= 'sealing failed. ';
+		return $row;
+	}
+	$sealed_b64 = base64_encode( $sealed_raw );
+
+	$row['user'] = $admin->user_login;
+	$row['uuid'] = $uuid;
+
+	// ── 9. Deliver on the dedicated channel; durable retry on non-2xx (ciphertext
+	// ONLY persisted — never plaintext). ──
+	if ( zs_fleet_ue_onboard_deliver( $sealed_b64, $uuid, $admin->user_login ) ) {
+		delete_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED );
+		$row['outcome']   = 'onboarded';
+		$row['delivery']  = 'delivered';
+		$row['message']  .= 'onboarded: sealed secret delivered. ';
+	} else {
+		update_option(
+			ZS_FLEET_UE_OPT_ONBOARD_UNACKED,
+			array(
+				'sealed' => $sealed_b64,
+				'uuid'   => $uuid,
+				'user'   => $admin->user_login,
+				'at'     => gmdate( 'c' ),
+			),
+			false
+		);
+		$row['outcome']  = 'onboarded'; // credential IS minted + sealed; delivery will retry next cron.
+		$row['delivery'] = 'pending';
+		$row['message'] .= 'onboarded: sealed secret stored for durable retry (delivery non-2xx). ';
+	}
+	return $row;
+}
+
+/** Revert an onboard install we performed: deactivate + remove the plugin dir. */
+function zs_fleet_ue_onboard_revert( $slug, $pf ) {
+	if ( function_exists( 'deactivate_plugins' ) && $pf !== '' ) {
+		deactivate_plugins( $pf, true );
+	}
+	$live = zs_fleet_ue_live_path( $slug );
+	if ( ! is_wp_error( $live ) && is_dir( $live ) ) {
+		zs_fleet_ue_rrmdir( $live );
+	}
+	wp_clean_plugins_cache( false );
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  * RUN
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -1242,8 +1922,15 @@ function zs_fleet_ue_rollback_one_theme( $update ) {
  */
 function zs_fleet_ue_run( $manifest ) {
 	$mode    = $manifest['mode'];
+	$nonce   = isset( $manifest['nonce'] ) ? (string) $manifest['nonce'] : '';
 	$results = array();
 	foreach ( $manifest['updates'] as $update ) {
+		if ( $mode === 'onboard' ) {
+			// Fixed-verb ritual — no type/slug branching. Thread the nonce so the
+			// handler can consume it at the M1 point (after health, before mint).
+			$results[] = zs_fleet_ue_onboard_flowguard( $update, $nonce );
+			continue;
+		}
 		$is_theme = ( isset( $update['type'] ) && $update['type'] === 'theme' );
 		if ( $mode === 'rollback' ) {
 			$results[] = $is_theme
@@ -1290,15 +1977,18 @@ function zs_fleet_ue_process_envelope( $envelope ) {
 		return new WP_Error( 'expired', 'manifest expired' );
 	}
 	// Replay guard: refuse a consumed nonce on state-mutating modes (apply +
-	// rollback); shadow is idempotent and exempt.
-	$mutating = in_array( $manifest['mode'], array( 'apply', 'rollback' ), true );
+	// rollback + onboard); shadow is idempotent and exempt.
+	$mutating = in_array( $manifest['mode'], array( 'apply', 'rollback', 'onboard' ), true );
 	if ( $mutating && zs_fleet_ue_nonce_consumed( $manifest['nonce'] ) ) {
 		return new WP_Error( 'replay', 'nonce already consumed' );
 	}
 
 	$report = zs_fleet_ue_run( $manifest );
 
-	if ( $mutating ) {
+	// apply/rollback consume the nonce here (after the whole run). onboard consumes
+	// its OWN nonce INSIDE the handler — after install+health, BEFORE mint (M1) — so a
+	// crash during mint/deliver cannot re-run and re-rotate; do NOT double-consume it.
+	if ( $mutating && $manifest['mode'] !== 'onboard' ) {
 		zs_fleet_ue_consume_nonce( $manifest['nonce'] );
 	}
 	update_option( ZS_FLEET_UE_OPT_REPORT, $report, false );
@@ -1664,6 +2354,10 @@ function zs_fleet_ue_cron_run() {
 	);
 
 	try {
+		// Durable retry of a pending sealed onboard secret (delivery net, independent
+		// of the manifest that minted it — M1). Runs every enrolled cycle until 2xx-acked.
+		zs_fleet_ue_onboard_retry_delivery();
+
 		$env = zs_fleet_ue_pull_envelope();
 		if ( is_wp_error( $env ) ) {
 			error_log( '[zs-fleet] engine pull: ' . $env->get_error_message() );
