@@ -1959,6 +1959,24 @@ function zs_fleet_ue_run( $manifest ) {
  * Full gated entry: verify a signed envelope end-to-end, then run.
  * Returns the report array, or WP_Error if any gate fails.
  */
+/**
+ * Canonical site key — MUST mirror the control-plane's normalizeSite() so a manifest
+ * issued for the normalized domain matches this site's host regardless of www/scheme/
+ * slash/case/port. Conservative: only a leading www. is stripped (never other
+ * subdomains), so a manifest can still only ever run on the SAME registrable host.
+ */
+function zs_fleet_ue_normalize_site( $s ) {
+	$h = strtolower( trim( (string) $s ) );
+	if ( $h === '' ) {
+		return '';
+	}
+	$h = preg_replace( '#^https?://#', '', $h );
+	$h = preg_replace( '#^(?:www\.)+#', '', $h );
+	$h = explode( '/', $h )[0];
+	$h = explode( ':', $h )[0];
+	return trim( $h );
+}
+
 function zs_fleet_ue_process_envelope( $envelope ) {
 	$manifest = zs_fleet_ue_verify_envelope( $envelope, ZS_FLEET_UE_PUBKEY );
 	if ( is_wp_error( $manifest ) ) {
@@ -1968,9 +1986,12 @@ function zs_fleet_ue_process_envelope( $envelope ) {
 	if ( $shape !== '' ) {
 		return new WP_Error( 'bad_shape', $shape );
 	}
-	// Site binding: a manifest can only ever run on its named site.
-	$host = wp_parse_url( home_url(), PHP_URL_HOST );
-	if ( strcasecmp( (string) $manifest['site'], (string) $host ) !== 0 ) {
+	// Site binding: a manifest can only ever run on its named site. Both sides are
+	// normalized (www/scheme/slash/case/port) so the control-plane's normalized
+	// manifest.site matches a www.-fronted home_url — while still binding to the
+	// same registrable host (never a different subdomain).
+	$host = zs_fleet_ue_normalize_site( wp_parse_url( home_url(), PHP_URL_HOST ) );
+	if ( strcasecmp( zs_fleet_ue_normalize_site( (string) $manifest['site'] ), $host ) !== 0 ) {
 		return new WP_Error( 'wrong_site', "manifest for {$manifest['site']} delivered to {$host}" );
 	}
 	if ( ! zs_fleet_ue_not_expired( $manifest['expires_at'], time() ) ) {
