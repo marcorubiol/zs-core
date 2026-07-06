@@ -19,6 +19,7 @@ wp-content/mu-plugins/
     ├── zs-fleet.php        ← bootstrap (header + glob('modules/*.php'))
     └── modules/
         ├── zs-no-admin-mods.php  ← hardening: admin-mods block + XML-RPC lockdown + auto-update OFF (v1.2.0)
+        ├── no-user-enum.php      ← hardening: blocks username enumeration (author archives + REST + sitemap)
         └── auto-update.php       ← self-update from GitHub releases
 ```
 
@@ -31,6 +32,7 @@ file at top level `require_once`s the bootstrap inside the directory.
 |---------------------|---------------------------------------------------------|
 | `no-admin-mods`     | Blocks plugin/theme/core install/update/delete from wp-admin browser. Whitelisted operator emails, MainWP Child, WP-CLI and WP-Cron continue to work. |
 | `disable-xmlrpc`    | Disables XML-RPC site-wide (xmlrpc_enabled false + empty methods array + no RSD link + no X-Pingback header). |
+| `no-user-enum`      | Closes username enumeration: author archives (`/author/slug/` and `?author=N`) return 404 before the canonical redirect can leak the login slug; the REST `/wp/v2/users` endpoint is stripped for anonymous callers; the core users sitemap provider is dropped. Logged-in builder/editor REST calls are untouched. |
 | `auto-update`       | Daily WP_Cron pulls new releases from GitHub. Atomic swap, prereleases ignored. |
 | `update-engine`     | **Fleet v2.** Pulls a SIGNED manifest from the control-plane, applies plugin updates with file-level stash/rollback, self-verifies (version + active + HTTP + fingerprint), reports JSON. **Ships inert** — no-op until `ZS_FLEET_UE_CONTROL_URL` + `ZS_FLEET_UE_PUBKEY` are set. Contract: `fleet-toolkit/docs/fleet-v2-architecture.md`. |
 
@@ -58,6 +60,7 @@ Currently exposed flags:
 |-------------------|---------------------------------------|
 | `disable-xmlrpc`  | `zs_fleet_disable_xmlrpc_enabled`     |
 | `auto-update`     | `zs_fleet_auto_update_enabled`        |
+| `no-user-enum`    | `zs_fleet_no_user_enum_enabled`       |
 
 When you add a new module, follow the same pattern: gate every hook
 on `apply_filters('zs_fleet_<slug>_enabled', true)` returning truthy,
