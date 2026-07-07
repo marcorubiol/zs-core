@@ -248,7 +248,13 @@ function zs_fleet_au_check_and_apply() {
 		return $sig_check;
 	}
 
-	$tmp_dir = trailingslashit( get_temp_dir() ) . 'zs-fleet-check-' . uniqid();
+	// Stage extraction on the SAME filesystem as the live mu-plugin dir so the install
+	// is an atomic same-fs rename. get_temp_dir() is often a different mount (e.g. on
+	// shared hosts like Hostinger) → the install rename() fails with EXDEV and the swap
+	// aborts + rolls back, so the site never self-updates. A dot-prefixed staging dir
+	// under WPMU_PLUGIN_DIR is not scanned by WordPress (top-level *.php only) and is
+	// removed on every path below.
+	$tmp_dir = trailingslashit( WPMU_PLUGIN_DIR ) . '.zs-fleet-stage-' . uniqid();
 	if ( ! mkdir( $tmp_dir, 0755, true ) ) {
 		@unlink( $tmp_zip );
 		return new WP_Error( 'mkdir_tmp', 'could not create extraction dir' );

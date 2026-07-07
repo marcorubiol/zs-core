@@ -1484,23 +1484,6 @@ function zs_fleet_ue_onboard_lowest_admin() {
 	return ( $u instanceof WP_User ) ? $u : null;
 }
 
-/** The user's application-password record matching $name, or null. */
-function zs_fleet_ue_onboard_find_app_password( $user_id, $name ) {
-	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
-		return null;
-	}
-	$pws = WP_Application_Passwords::get_user_application_passwords( (int) $user_id );
-	if ( ! is_array( $pws ) ) {
-		return null;
-	}
-	foreach ( $pws as $pw ) {
-		if ( isset( $pw['name'] ) && $pw['name'] === $name ) {
-			return $pw;
-		}
-	}
-	return null;
-}
-
 /** Delete every application-password named $name (rotate-in-place cleanup). */
 function zs_fleet_ue_onboard_strip_app_passwords( $user_id, $name ) {
 	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
@@ -1806,9 +1789,10 @@ function zs_fleet_ue_onboard_flowguard( $update, $nonce = '' ) {
 		zs_fleet_ue_consume_nonce( $nonce );
 	}
 
-	// ── 7. Mint. M1 re-mint guard: only mint a FRESH credential when neither a
-	// 'fleet-flowguard' app-password already exists NOR a sealed blob is pending
-	// delivery — never rotate a possibly-delivered credential blindly. ──
+	// ── 7. Mint. M1 guard: if a sealed blob is still pending delivery, the durable
+	// retry path owns it — do not rotate. Otherwise mint fresh (rotating any stale
+	// same-name password), because a fresh, non-replayed onboard manifest means the
+	// operator needs a deliverable credential and none is currently pending. ──
 	if ( ! class_exists( 'WP_Application_Passwords' ) ) {
 		$row['outcome']  = 'error';
 		$row['message'] .= 'WP_Application_Passwords unavailable (WP < 5.6?). ';
@@ -1821,25 +1805,23 @@ function zs_fleet_ue_onboard_flowguard( $update, $nonce = '' ) {
 		return $row;
 	}
 
-	$app_name    = 'fleet-flowguard';
-	$existing_pw = zs_fleet_ue_onboard_find_app_password( $admin->ID, $app_name );
-	$unacked     = get_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED, null );
-	if ( $existing_pw !== null || is_array( $unacked ) ) {
-		// A credential is already minted (and possibly delivered) OR a sealed blob is
-		// still pending delivery. Do NOT rotate — the durable-retry path finishes any
-		// pending delivery. Report onboarded (site is configured) without a fresh mint.
-		$row['outcome'] = 'onboarded';
-		$row['user']    = $admin->user_login;
-		if ( is_array( $existing_pw ) && isset( $existing_pw['uuid'] ) ) {
-			$row['uuid'] = (string) $existing_pw['uuid'];
-		}
-		$row['message'] .= 'app-password already present — not rotated (M1); '
-			. ( is_array( $unacked ) ? 'delivery still pending. ' : 'previously delivered. ' );
+	$app_name = 'fleet-flowguard';
+	$unacked  = get_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED, null );
+	if ( is_array( $unacked ) ) {
+		// A sealed blob is already minted and awaiting delivery — the durable-retry
+		// path (every cron) is finishing it. Do NOT rotate: that would strand the
+		// pending credential. Report the site configured; delivery completes async.
+		$row['outcome']  = 'onboarded';
+		$row['user']     = $admin->user_login;
+		$row['delivery'] = 'pending';
+		$row['message'] .= 'M1: sealed app-password minted, delivery still pending — not rotated. ';
 		return $row;
 	}
 
-	// Fresh mint. Rotate-in-place: strip any stale same-name password first (the M1
-	// guard above guarantees none, but this keeps the name unique defensively).
+	// Fresh mint. Rotate-in-place: strip any stale same-name password first. If a
+	// prior mint's delivery silently failed and left no unacked blob (e.g. a crash
+	// after mint, before persist), this is how the site recovers — the stale,
+	// never-confirmed credential is replaced by a fresh, deliverable one.
 	zs_fleet_ue_onboard_strip_app_passwords( $admin->ID, $app_name );
 	$created = WP_Application_Passwords::create_new_application_password(
 		$admin->ID,
@@ -1857,14 +1839,6 @@ function zs_fleet_ue_onboard_flowguard( $update, $nonce = '' ) {
 	// ── 8. Seal (byte-identical to the operator's PyNaCl unseal). ──
 	$plaintext  = zs_fleet_ue_onboard_plaintext( $admin->user_login, $uuid, $plain_pw );
 	$sealed_raw = sodium_crypto_box_seal( $plaintext, $seal_pub );
-	// Wipe plaintext from memory the moment it is sealed.
-	if ( function_exists( 'sodium_memzero' ) ) {
-		sodium_memzero( $plain_pw );
-		sodium_memzero( $plaintext );
-	} else {
-		$plain_pw  = '';
-		$plaintext = '';
-	}
 	if ( ! is_string( $sealed_raw ) || $sealed_raw === '' ) {
 		$row['outcome']  = 'error';
 		$row['message'] .= 'sealing failed. ';
@@ -1872,27 +1846,49 @@ function zs_fleet_ue_onboard_flowguard( $update, $nonce = '' ) {
 	}
 	$sealed_b64 = base64_encode( $sealed_raw );
 
+	// Persist the sealed blob (ciphertext ONLY, never plaintext) BEFORE we wipe or
+	// deliver. If anything after this point dies — a memzero fatal on a sodium_compat
+	// host, a delivery timeout, an OOM — the durable-retry path (every cron) still
+	// finishes delivery, so a minted credential is never stranded undelivered.
+	update_option(
+		ZS_FLEET_UE_OPT_ONBOARD_UNACKED,
+		array(
+			'sealed' => $sealed_b64,
+			'uuid'   => $uuid,
+			'user'   => $admin->user_login,
+			'at'     => gmdate( 'c' ),
+		),
+		false
+	);
+
+	// Wipe plaintext now that it is sealed. sodium_memzero() is native-only: WordPress's
+	// sodium_compat polyfill DEFINES it but THROWS ("cannot securely wipe memory from
+	// PHP"), so function_exists() is not enough — require the native extension and fall
+	// back to a plain overwrite (best effort) otherwise. try/catch belt-and-suspenders.
+	if ( extension_loaded( 'sodium' ) && function_exists( 'sodium_memzero' ) ) {
+		try {
+			sodium_memzero( $plain_pw );
+			sodium_memzero( $plaintext );
+		} catch ( \Throwable $e ) {
+			$plain_pw  = '';
+			$plaintext = '';
+		}
+	} else {
+		$plain_pw  = '';
+		$plaintext = '';
+	}
+
 	$row['user'] = $admin->user_login;
 	$row['uuid'] = $uuid;
 
-	// ── 9. Deliver on the dedicated channel; durable retry on non-2xx (ciphertext
-	// ONLY persisted — never plaintext). ──
+	// ── 9. Deliver on the dedicated channel. The unacked blob persisted above is the
+	// durable retry net; clear it ONLY on a 2xx ack. ──
 	if ( zs_fleet_ue_onboard_deliver( $sealed_b64, $uuid, $admin->user_login ) ) {
 		delete_option( ZS_FLEET_UE_OPT_ONBOARD_UNACKED );
 		$row['outcome']   = 'onboarded';
 		$row['delivery']  = 'delivered';
 		$row['message']  .= 'onboarded: sealed secret delivered. ';
 	} else {
-		update_option(
-			ZS_FLEET_UE_OPT_ONBOARD_UNACKED,
-			array(
-				'sealed' => $sealed_b64,
-				'uuid'   => $uuid,
-				'user'   => $admin->user_login,
-				'at'     => gmdate( 'c' ),
-			),
-			false
-		);
 		$row['outcome']  = 'onboarded'; // credential IS minted + sealed; delivery will retry next cron.
 		$row['delivery'] = 'pending';
 		$row['message'] .= 'onboarded: sealed secret stored for durable retry (delivery non-2xx). ';
