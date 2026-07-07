@@ -37,6 +37,7 @@ jobs:
           set -e
           php tests/test-engine-pure.php
           php tests/test-stash-restore.php
+          php tests/test-proxy-https.php
 
       - name: Build release zip
         run: |
