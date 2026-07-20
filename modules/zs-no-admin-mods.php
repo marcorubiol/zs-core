@@ -295,8 +295,24 @@ add_filter( 'pre_option_auto_update_themes', function () {
 } );
 
 /**
- * Kill the core auto-update background process. WP normally runs
- * minor-core auto-updates via wp-cron; MainWP's Phase 5 handles core
- * with explicit OK, so having the background updater run is a race.
+ * Core auto-updates: RESTORE WordPress's native MINOR/security background
+ * updater; keep MAJOR disabled (operator/engine-gated).
+ *
+ * Previously this filtered `automatic_updater_disabled => __return_true`, which
+ * is NOT scoped to core — is_disabled() short-circuits WP_Automatic_Updater::run()
+ * before the plugin, theme, translation AND core loops, so it killed every
+ * background update class at once. That was fine while MainWP owned the cadence,
+ * but with MainWP demoted to observation (Fleet v2) and the pull-engine not
+ * handling core (update-engine.php rejects type != plugin|theme), NOTHING patched
+ * core — the fleet sat on 6.9.4 / 7.0.0 through CVE-2026-63030 (pre-auth RCE).
+ *
+ * These two filters run LAST in Core_Upgrader::should_update_to_version() (after
+ * the WP_AUTO_UPDATE_CORE constant and the auto_update_core_* options), so they
+ * deterministically pin minor/security ON, major OFF regardless of host config.
+ * Plugin/theme auto-updates stay OFF via the forced-empty options above — the v2
+ * engine owns those with its health-gate + rollback. Minor core is the one class
+ * safe for the native updater: security-only, schema-stable, with WP's own
+ * filesystem rollback on checksum/verify failure.
  */
-add_filter( 'automatic_updater_disabled', '__return_true' );
+add_filter( 'allow_minor_auto_core_updates', '__return_true' );
+add_filter( 'allow_major_auto_core_updates', '__return_false' );
