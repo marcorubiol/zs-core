@@ -171,7 +171,28 @@ complete and the module set is settled. Bumps follow semver:
 - **Minor** — new module added.
 - **Patch** — fix or behaviour tweak inside an existing module.
 
-Release checklist (do not skip — header and tag must match):
+**The whole checklist below is automated by `deploy/release.sh`** — it runs the same
+gates CI runs *before* creating the tag, refuses to proceed if the header and the
+`ZS_FLEET_VERSION` constant disagree (the desync that once caused a fleet-wide
+re-download loop), verifies that the derived public key equals the one baked into the
+engine, verifies the detached signature the way `zs_fleet_au_verify_zip_signature()`
+does *before* publishing it, and fails loudly if the `.sig` is missing from the release
+— the one omission that silently stops every v0.3.x site from ever self-updating again.
+
+```bash
+deploy/release.sh 0.3.9 --push      # cut, sign, verify, upload, then au-push
+deploy/release.sh 0.3.9 --dry-run   # print the plan, touch nothing
+deploy/release.sh 0.3.9 --canary    # hyphenated tag => prerelease => fleet does NOT take it
+```
+
+It never holds the signing key: it reads it from `$ZS_RELEASE_SIGNING_SK`, else the
+macOS Keychain (`security add-generic-password -s zs-release-signing -a "$USER" -T '' -w`
+— the `-T ''` means every use prompts for authorisation), else an interactive silent
+prompt. Signing stays the one step a human authorises, deliberately: it is the only
+irreversible act in the whole system (no rollback, no canary staging, ships to 16 client
+sites on a signature alone). Re-runnable — an existing tag, zip or `.sig` is skipped.
+
+The manual steps, for reference (and for when something needs doing by hand):
 
 1. Bump `Version:` in `zs-fleet.php` header AND `ZS_FLEET_VERSION` constant.
 2. Bump `Version:` in `deploy/zs-fleet-loader.php` header.
