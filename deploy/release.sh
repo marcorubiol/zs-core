@@ -157,29 +157,43 @@ fi
 
 # ── 5. verify the signature the way the ENGINE does, before publishing it ──
 step "verify signature (reproducing zs_fleet_au_verify_zip_signature)"
+# ONE verification path, always against files in $ROOT. An earlier version verified an
+# already-published .sig from a `mktemp -d` directory and always failed — Colima does not
+# mount /var/folders, so the container saw an empty directory and read nothing. It reported
+# that as "signature does not verify": a verifier that cannot tell "I could not read this"
+# from "this is invalid" is worse than no verifier, so the check below proves it read real
+# bytes first and only then judges the signature.
 if [ "$DRY" = "1" ]; then
   echo "   [dry-run] would verify the detached signature against $PUBKEY"
-elif [ -f zs-fleet.zip.sig ]; then
-  # ZS_PUB in argv is fine — it is the PUBLIC key, and passing it in means this check
-  # always uses the key actually baked into the engine, never a copy that could drift.
+else
+  # If the .sig is published but not local (a re-run, or a release signed by hand), fetch
+  # it next to the zip rather than verifying from somewhere the container cannot see.
+  [ -f zs-fleet.zip ]     || run "gh release download '$TAG' --repo '$REPO' -p zs-fleet.zip --clobber"
+  [ -f zs-fleet.zip.sig ] || gh release download "$TAG" --repo "$REPO" -p zs-fleet.zip.sig --clobber >/dev/null 2>&1
+  [ -f zs-fleet.zip ]     || die "zs-fleet.zip missing locally — cannot verify"
+  [ -f zs-fleet.zip.sig ] || die "no .sig locally or on the release — nothing to verify"
+  # ZS_PUB in argv is fine — it is the PUBLIC key, and passing it in means this check always
+  # uses the key actually baked into the engine, never a copy that could drift.
   docker run --rm -v "$ROOT":/app -w /app -e ZS_PUB="$PUBKEY" "$PHP_IMAGE" php -r '
-    $zip = file_get_contents("zs-fleet.zip");
-    $sig = base64_decode(trim(file_get_contents("zs-fleet.zip.sig")), true);
+    $zipf = "zs-fleet.zip"; $sigf = "zs-fleet.zip.sig";
+    if (!is_readable($zipf) || !is_readable($sigf)) {
+      fwrite(STDERR, "   CANNOT READ the artifacts inside the container (mount problem, not a bad signature)\n");
+      exit(2);
+    }
+    $zip = file_get_contents($zipf);
+    $sig = base64_decode(trim(file_get_contents($sigf)), true);
+    if ($zip === "" || strlen($sig) !== 64) {
+      fwrite(STDERR, "   MALFORMED artifacts: zip=" . strlen($zip) . "B sig=" . strlen((string) $sig) . "B (sig must be 64)\n");
+      exit(2);
+    }
     $msg = "ZS-FLEET-RELEASE" . chr(0) . hash("sha256", $zip, true);
     $ok  = sodium_crypto_sign_verify_detached($sig, $msg, base64_decode(getenv("ZS_PUB"), true));
-    fwrite(STDOUT, "   sha256=" . hash("sha256", $zip) . "\n   valid=" . ($ok ? "YES" : "NO") . "\n");
+    fwrite(STDOUT, "   zip=" . strlen($zip) . "B sha256=" . hash("sha256", $zip) . "\n   valid=" . ($ok ? "YES" : "NO") . "\n");
     exit($ok ? 0 : 1);
-  ' 2>&1 || die "SIGNATURE DOES NOT VERIFY — do not upload it"
-else
-  echo "   no local .sig (already uploaded in a previous run) — verifying the published one"
-  tmp="$(mktemp -d)"; ( cd "$tmp" && gh release download "$TAG" --repo "$REPO" -p 'zs-fleet.zip*' --clobber >/dev/null 2>&1 )
-  docker run --rm -v "$tmp":/app -w /app -e ZS_PUB="$PUBKEY" "$PHP_IMAGE" php -r '
-    $zip = file_get_contents("zs-fleet.zip");
-    $sig = base64_decode(trim(file_get_contents("zs-fleet.zip.sig")), true);
-    $msg = "ZS-FLEET-RELEASE" . chr(0) . hash("sha256", $zip, true);
-    exit(sodium_crypto_sign_verify_detached($sig, $msg, base64_decode(getenv("ZS_PUB"), true)) ? 0 : 1);
-  ' >/dev/null 2>&1 && echo "   published signature verifies" || die "published signature does NOT verify"
-  rm -rf "$tmp"
+  '
+  rc=$?
+  [ "$rc" = "2" ] && die "could not verify (see above) — resolve this before publishing anything"
+  [ "$rc" = "0" ] || die "SIGNATURE DOES NOT VERIFY — the fleet would refuse this release"
 fi
 
 # ── 6. publish the signature + prove it is there ──
