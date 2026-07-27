@@ -260,6 +260,71 @@ function zs_fleet_ue_classify( $to, $ver_after, $active_before, $active_after, $
 }
 
 /**
+ * WHICH verify gates failed (pure) — the WHY behind classify()'s verdict, never a
+ * second opinion. Same inputs, same order, same semantics.
+ *
+ * Deliberately a SIBLING of classify() rather than a wider return type on it:
+ * classify()'s string lands in $row['outcome'], which the control-plane branches on
+ * to freeze rollouts. The function that can stop the fleet stays boring, and the
+ * theme path (which never calls classify()) can reuse this without inheriting an
+ * active-gate it intentionally omits from its verdict.
+ *
+ * INVARIANT, locked by a test over all 48 input combinations:
+ *   zs_fleet_ue_classify(...) === 'applied'  ⟺  this returns array().
+ *
+ * @return string[] subset of version|active|http|fingerprint, in that order.
+ */
+function zs_fleet_ue_failed_gates( $to, $ver_after, $active_before, $active_after, $http_after, $fingerprint_ok ) {
+	$gates  = array();
+	$expect = (int) ( defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ? ZS_FLEET_UE_HEALTH_EXPECT : 200 );
+	if ( (string) $ver_after !== (string) $to ) {
+		$gates[] = 'version';
+	}
+	// Mirrors classify()'s $active_ok: inactive-before is never an active failure.
+	if ( $active_before && ! $active_after ) {
+		$gates[] = 'active';
+	}
+	if ( (int) $http_after !== $expect ) {
+		$gates[] = 'http';
+	}
+	if ( ! $fingerprint_ok ) {
+		$gates[] = 'fingerprint';
+	}
+	return $gates;
+}
+
+/**
+ * The PRE-ROLLBACK evidence block (pure).
+ *
+ * Why this exists: zs_fleet_ue_rollback() re-measures AFTER restoring and overwrites
+ * five keys of $row with post-restore values. That is correct — those values are the
+ * proof the site recovered, and the $healthy gate is computed from them — but it means
+ * a real failure reports version_after=<old>, http_after=200, fingerprint_ok=true with
+ * the message "verify failed": every field green, nothing to act on. (Production,
+ * 2026-07-24: an update was abandoned because nobody could tell which gate tripped.)
+ *
+ * MEMBERSHIP RULE: exactly the keys zs_fleet_ue_rollback() overwrites, plus the derived
+ * gate list. Add a key to that clobber list → add it here. Do NOT copy version_before /
+ * schema_changed / schema_probe: neither rollback function touches them, so they already
+ * survive at top level.
+ *
+ * NEVER response bytes: the check-in body is capped at 256 KB control-plane side, and a
+ * fat blob would 413 → no 2xx → the report is never delivered and the site also looks
+ * silent. fingerprint_reason is a fixed 6-token vocabulary.
+ */
+function zs_fleet_ue_verify_evidence( $to, $ver_after, $active_before, $active_after, $http_after, $http_time_s, $fingerprint_ok, $body ) {
+	return array(
+		'failed_gates'       => zs_fleet_ue_failed_gates( $to, $ver_after, $active_before, $active_after, $http_after, $fingerprint_ok ),
+		'version_after'      => $ver_after,
+		'active_after'       => $active_after,
+		'http_after'         => $http_after,
+		'http_time_s'        => $http_time_s,
+		'fingerprint_ok'     => $fingerprint_ok,
+		'fingerprint_reason' => zs_fleet_ue_fingerprint_reason( $body ),
+	);
+}
+
+/**
  * Schema signature (pure): a deterministic sha1 over the STRUCTURAL projection of
  * the database — table list, columns, indexes — that zs_fleet_ue_schema_signature()
  * pulls from information_schema. Used strictly as a SAME-SERVER before/after delta
@@ -467,24 +532,42 @@ function zs_fleet_ue_raise_limits() {
 	}
 }
 
-/** Cheap content fingerprint (Nivel 1): no PHP fatal, has a closing </html>. */
-function zs_fleet_ue_fingerprint_ok( $body ) {
+/**
+ * WHY the content fingerprint failed (pure). Fixed vocabulary — NEVER response bytes.
+ *
+ * Exists because "failed_gates: [fingerprint]" alone leaves the operator exactly where
+ * this release is trying to stop leaving them: a PHP fatal, a truncated render and a
+ * dead database are three different investigations. The other three gates are
+ * self-explanatory from the numbers in the evidence block; this one is not.
+ *
+ * @return string ''|empty|db_error|parse_error|php_fatal|truncated  ('' = body passes)
+ */
+function zs_fleet_ue_fingerprint_reason( $body ) {
 	if ( $body === '' ) {
-		return false;
+		return 'empty';
 	}
-	$needles = array(
-		'There has been a critical error',
-		'Fatal error',
-		'Parse error:',
-		'Error establishing a database connection',
-	);
-	foreach ( $needles as $n ) {
-		if ( stripos( $body, $n ) !== false ) {
-			return false;
-		}
+	if ( stripos( $body, 'Error establishing a database connection' ) !== false ) {
+		return 'db_error';
+	}
+	if ( stripos( $body, 'Parse error:' ) !== false ) {
+		return 'parse_error';
+	}
+	if ( stripos( $body, 'There has been a critical error' ) !== false || stripos( $body, 'Fatal error' ) !== false ) {
+		return 'php_fatal';
 	}
 	// Minimal structural sanity — a rendered WP page closes the document.
-	return stripos( $body, '</html>' ) !== false;
+	if ( stripos( $body, '</html>' ) === false ) {
+		return 'truncated';
+	}
+	return '';
+}
+
+/**
+ * Cheap content fingerprint (Nivel 1): no PHP fatal, has a closing </html>.
+ * Same needles, same checks as before — now expressed once, in the reason function.
+ */
+function zs_fleet_ue_fingerprint_ok( $body ) {
+	return zs_fleet_ue_fingerprint_reason( $body ) === '';
 }
 
 /**
@@ -667,6 +750,9 @@ function zs_fleet_ue_rollback( &$row, $slug, $pf, $stash, $from, $active_before,
 	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
 	$fp_ok                      = zs_fleet_ue_fingerprint_ok( $body );
 
+	// These five are the FINAL (post-restore) state and are the evidence for the $healthy
+	// gate below — overwriting them here is correct, NOT a bug to fix. The verify-time
+	// epoch they replace is preserved by the caller in $row['verify'].
 	$row['version_after']  = $ver_after;
 	$row['active_after']   = $active_after;
 	$row['http_after']     = $code;
@@ -912,6 +998,16 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 		return $row;
 	}
 
+	// Freeze the verify-time epoch BEFORE anything downstream can overwrite it. Every
+	// local read here was measured above and is untouched since; zs_fleet_ue_rollback()
+	// will shortly re-measure and clobber the five top-level *_after keys with the
+	// post-restore state. One insertion point covers all four ways out of a failed
+	// verdict below (force-override, db-touch, schema_changed, plain rollback) — and a
+	// forced apply carrying verify.failed_gates:["version"] is exactly the record you
+	// want, since it names precisely which gate the operator waived.
+	$row['verify'] = zs_fleet_ue_verify_evidence( $to, $ver_after, $active_before, $active_after, $code, $secs, $fp_ok, $body );
+	$gates_txt     = $row['verify']['failed_gates'] ? implode( ',', $row['verify']['failed_gates'] ) : 'unknown';
+
 	// ── force-override: version mismatch ONLY, health gates all green ──
 	// Guarded against db-touch / measured schema move (those keep the no-trusted-
 	// rollback treatment below). Recorded explicitly so the report/timeline never
@@ -946,11 +1042,15 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	// abstain) both fall through to the normal file rollback below, unchanged.
 	if ( $touches_db || $row['schema_changed'] === true ) {
 		$row['outcome'] = 'error';
-		$row['message'] .= 'verify failed and no rollback available ('
+		$row['message'] .= 'verify failed [' . $gates_txt . '] and no rollback available ('
 			. ( $touches_db ? 'db-touch' : 'schema_changed → DB ahead of files, host snapshot needed' ) . ').';
 		return $row;
 	}
-	zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'verify failed →' );
+	// The failed gate rides in via $reason, which zs_fleet_ue_rollback() already
+	// concatenates into the message — so the string the operator actually reads becomes
+	// "verify failed [http] → restored to 3.2.6 (verified healthy)." with ZERO lines
+	// changed inside the rollback function itself.
+	zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'verify failed [' . $gates_txt . '] →' );
 	return $row;
 }
 
@@ -1093,6 +1193,17 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 		zs_fleet_ue_prune_stashes( $slug );
 		return $row;
 	}
+
+	// Same evidence snapshot as the plugin path (see apply_one). Reads the active pair
+	// from $row because this path never binds them to locals. NOTE the deliberate
+	// asymmetry: the verdict above has no active gate (WP does not deactivate themes on
+	// upgrade), but the evidence block computes all four — so a theme report may LIST
+	// 'active' informationally. It can never be the lone gate here, since reaching this
+	// line means version/http/fingerprint already disagree. Adding the active gate to the
+	// theme VERDICT would be a behaviour change that could cause new rollbacks: not now.
+	$row['verify'] = zs_fleet_ue_verify_evidence( $to, $ver_after, $row['active_before'], $row['active_after'], $code, $secs, $fp_ok, $body );
+	$gates_txt     = $row['verify']['failed_gates'] ? implode( ',', $row['verify']['failed_gates'] ) : 'unknown';
+
 	// force-override: version mismatch ONLY, health green, no schema move (see apply_one).
 	if ( $force && $row['schema_changed'] !== true && (string) $ver_after !== (string) $to && $code === (int) ZS_FLEET_UE_HEALTH_EXPECT && $fp_ok ) {
 		$row['outcome']                   = 'applied';
@@ -1110,10 +1221,10 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	// theme file rollback below.
 	if ( $row['schema_changed'] === true ) {
 		$row['outcome']  = 'error';
-		$row['message'] .= 'theme verify failed and no safe rollback (schema_changed → DB ahead of files, host snapshot needed).';
+		$row['message'] .= 'theme verify failed [' . $gates_txt . '] and no safe rollback (schema_changed → DB ahead of files, host snapshot needed).';
 		return $row;
 	}
-	zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme verify failed →' );
+	zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme verify failed [' . $gates_txt . '] →' );
 	return $row;
 }
 

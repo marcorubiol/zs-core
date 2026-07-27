@@ -190,7 +190,14 @@ function zs_fleet_au_run() {
 			return;
 		}
 		if ( $result === false ) {
-			// Already current — not an error, not a successful update.
+			// Already current — not an error, not a successful update. Clear any stale
+			// error: a site that has REACHED the current version has, by definition, no
+			// outstanding auto-update failure. Without this, delete_option only ran on the
+			// success path below, so a single transient blip (a release whose .sig lands
+			// minutes after its zip, a network hiccup) stuck in zs_fleet_au_last_error
+			// forever on an otherwise-healthy site — and resurfaced in the read-back of
+			// every subsequent au-push, where it had to be cleared by hand.
+			delete_option( ZS_FLEET_AU_OPT_ERROR );
 			return;
 		}
 		// $result is the version string we just installed.

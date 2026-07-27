@@ -139,6 +139,74 @@ check( zs_fleet_ue_classify( '1.1', '1.1', true, true, 500, true ) === 'verify_f
 check( zs_fleet_ue_classify( '1.1', '1.1', true, true, 200, false ) === 'verify_fail', 'fingerprint fail → fail' );
 check( zs_fleet_ue_classify( '1.1', '1.1', false, false, 200, true ) === 'applied', 'inactive→inactive is fine' );
 
+/* ── WHICH gate failed — the evidence the rollback used to destroy ──────── */
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', true, true, 200, true ) === array(), 'clean apply → no failed gates' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.0', true, true, 200, true ) === array( 'version' ), 'version not bumped → [version]' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', true, false, 200, true ) === array( 'active' ), 'silent deactivation → [active]' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', true, true, 500, true ) === array( 'http' ), 'HTTP 500 → [http]' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', true, true, 200, false ) === array( 'fingerprint' ), 'fingerprint fail → [fingerprint]' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', false, false, 200, true ) === array(), 'inactive→inactive is not an active failure' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.1', false, true, 200, true ) === array(), 'inactive→active is not a failure' );
+check( zs_fleet_ue_failed_gates( '1.1', '1.0', true, false, 0, false ) === array( 'version', 'active', 'http', 'fingerprint' ), 'total failure → all four, in order' );
+
+// THE anti-drift test. classify() decides whether the fleet freezes; failed_gates()
+// explains it. If they ever disagree, the report would name a gate the verdict did not
+// use (or claim a clean apply while listing failures). Full cartesian product of every
+// input dimension, aggregated into ONE check so CI output stays one line.
+$disagree = array();
+foreach ( array( '1.1', '1.0' ) as $va ) {
+	foreach ( array( true, false ) as $ab ) {
+		foreach ( array( true, false ) as $aa ) {
+			foreach ( array( 200, 500, 0 ) as $hc ) {
+				foreach ( array( true, false ) as $fp ) {
+					$applied = ( zs_fleet_ue_classify( '1.1', $va, $ab, $aa, $hc, $fp ) === 'applied' );
+					$clean   = ( zs_fleet_ue_failed_gates( '1.1', $va, $ab, $aa, $hc, $fp ) === array() );
+					if ( $applied !== $clean ) {
+						$disagree[] = "$va/$ab/$aa/$hc/$fp";
+					}
+				}
+			}
+		}
+	}
+}
+check( $disagree === array(), 'failed_gates agrees with classify across all 48 combinations' . ( $disagree ? ' — drift at: ' . implode( ' ', $disagree ) : '' ) );
+
+/* ── fingerprint reason (and the ok/reason equivalence after the refactor) ─ */
+check( zs_fleet_ue_fingerprint_reason( '' ) === 'empty', 'empty body → empty' );
+check( zs_fleet_ue_fingerprint_reason( '<html>ok</html>' ) === '', 'healthy body → no reason' );
+check( zs_fleet_ue_fingerprint_reason( '<html>There has been a critical error</html>' ) === 'php_fatal', 'WP fatal handler → php_fatal' );
+check( zs_fleet_ue_fingerprint_reason( '<html>Fatal error: bang</html>' ) === 'php_fatal', 'raw PHP fatal → php_fatal' );
+check( zs_fleet_ue_fingerprint_reason( 'Parse error: syntax error' ) === 'parse_error', 'parse error → parse_error' );
+check( zs_fleet_ue_fingerprint_reason( 'Error establishing a database connection' ) === 'db_error', 'db down → db_error' );
+check( zs_fleet_ue_fingerprint_reason( '<html><body>cut off' ) === 'truncated', 'no closing html → truncated' );
+// fingerprint_ok now delegates to reason — its behaviour must be unchanged for every fixture.
+$fp_fixtures = array( '', '<html>ok</html>', '<html>Fatal error: x</html>', 'Parse error: x',
+	'Error establishing a database connection', '<html><body>cut off', '<html>There has been a critical error</html>' );
+$fp_bad = array();
+foreach ( $fp_fixtures as $i => $b ) {
+	if ( zs_fleet_ue_fingerprint_ok( $b ) !== ( zs_fleet_ue_fingerprint_reason( $b ) === '' ) ) {
+		$fp_bad[] = $i;
+	}
+}
+check( $fp_bad === array(), 'fingerprint_ok === (reason === "") for every fixture' );
+
+/* ── the verify evidence block: shape, epoch separation, size discipline ── */
+$ev = zs_fleet_ue_verify_evidence( '3.2.7', '3.2.7', true, true, 502, 15.234, false, '<html>Fatal error: boom</html>' );
+check( $ev['failed_gates'] === array( 'http', 'fingerprint' ), 'evidence carries the failed gates' );
+check( $ev['http_after'] === 502 && $ev['http_time_s'] === 15.234, 'evidence carries the verify-time http measurement' );
+check( $ev['fingerprint_reason'] === 'php_fatal', 'evidence names WHY the fingerprint failed' );
+check( $ev['version_after'] === '3.2.7' && $ev['active_after'] === true, 'evidence carries verify-time version/active' );
+// Membership rule: exactly the five keys zs_fleet_ue_rollback() overwrites, plus the two
+// derived ones. Locks the contract so a future clobbered key gets added here too.
+check(
+	array_keys( $ev ) === array( 'failed_gates', 'version_after', 'active_after', 'http_after', 'http_time_s', 'fingerprint_ok', 'fingerprint_reason' ),
+	'evidence key set is exactly the rollback-clobbered keys + derived'
+);
+// Body-cap discipline: the check-in POST is capped at 256 KB control-plane side, and an
+// oversized report 413s → never delivered → the site also looks silent.
+check( strpos( json_encode( $ev ), 'boom' ) === false, 'evidence never ships response body bytes' );
+check( strlen( json_encode( $ev ) ) < 256, 'evidence block stays under 256 bytes' );
+
 /* ── Ed25519 envelope verification (the security-critical path) ──────────── */
 $kp     = sodium_crypto_sign_keypair();
 $sk     = sodium_crypto_sign_secretkey( $kp );
