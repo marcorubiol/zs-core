@@ -282,9 +282,11 @@ if ( ! defined( 'DISALLOW_FILE_EDIT' ) ) {
 }
 
 /**
- * Force auto-updates OFF at the option layer. Returning a hardcoded
- * empty array makes the "enable auto-updates" UI toggle inert — MainWP
- * owns the update cadence.
+ * Force plugin/theme auto-updates OFF at the option layer. Returning a
+ * hardcoded empty array makes the "enable auto-updates" UI toggle inert.
+ * The v2 pull engine owns those two classes, with its health gate and
+ * rollback. (Said "MainWP owns the update cadence" until 2026-07-29 —
+ * MainWP has been demoted to observation since Fleet v2.)
  */
 add_filter( 'pre_option_auto_update_plugins', function () {
 	return array();
@@ -316,3 +318,35 @@ add_filter( 'pre_option_auto_update_themes', function () {
  */
 add_filter( 'allow_minor_auto_core_updates', '__return_true' );
 add_filter( 'allow_major_auto_core_updates', '__return_false' );
+
+/**
+ * …and make sure the thing that READS those filters actually runs.
+ *
+ * The filters above are policy. `wp_maybe_auto_update` is the cron event that calls
+ * WP_Automatic_Updater::run(), which is the ONLY caller that consults them. Verified on
+ * 2026-07-29: the event was missing on **15 of 15** fleet sites, so since the v0.3.7 pass
+ * restored minor-core policy, nothing has ever asked for it. Same for translations, whose
+ * `auto_update_translation` filter defaults to true and equally never gets consulted —
+ * which is how "New translations are available" piled up in wp-admin unnoticed.
+ *
+ * Why it goes missing: mainwp-child registers its own wp_version_check handler (hence the
+ * duplicated event) that does `add_filter('automatic_updater_disabled','__return_true')`
+ * plus `remove_action('wp_maybe_auto_update','wp_maybe_auto_update')` — correct when MainWP
+ * owned the cadence, wrong now that it is demoted to observation. Re-scheduling from here
+ * is safe against that: its remove_action only applies inside its own request, never the
+ * one where the cron event fires.
+ *
+ * Scope of what this re-enables is exactly the two classes we want and nothing else, because
+ * the policy is already pinned above: plugins/themes stay off (forced-empty options — the v2
+ * engine owns those, with health gate and rollback), major core stays off, minor core and
+ * translations on. Translations are the safest class that exists: .mo/.po data, no executable
+ * code, no schema, nothing to roll back.
+ */
+add_action( 'init', function () {
+	if ( wp_installing() ) {
+		return;
+	}
+	if ( ! wp_next_scheduled( 'wp_maybe_auto_update' ) ) {
+		wp_schedule_event( time() + HOUR_IN_SECONDS, 'twicedaily', 'wp_maybe_auto_update' );
+	}
+} );
