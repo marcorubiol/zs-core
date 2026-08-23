@@ -28,12 +28,26 @@
  * ── Engine state machine (apply mode), per update ────────────────────────
  *   guard(from == on-disk?)  no → drift, skip
  *   pre-snapshot (version, active, http)
- *   STASH (copy live dir → wp-content/upgrade/zs-fleet-stash/) — stash-first:
+ *   STASH (copy live dir → wp-content/zs-fleet-stash/) — stash-first:
  *          if the copy fails (disk full), abort BEFORE touching live.
  *   APPLY  Plugin_Upgrader::upgrade(); capture was_active; reactivate.
  *   verify version==to AND active preserved AND http 200 AND fingerprint ok
  *          ok   → applied (retain stash, prune old)
  *          fail → RESTORE stash → rolled_back   (restore-fail → error, scream)
+ *
+ * ── Stash reachability invariant (incident 2026-08-23) ───────────────────
+ * The stash sits under wp-content/ because WP_Upgrader wipes every child of
+ * wp-content/upgrade/ mid-flight (see ZS_FLEET_UE_STASH_SUBDIR). That placement
+ * reasoned about WordPress, and about backup/scan paths — and never once about
+ * the WEB SERVER. The base was created with wp_mkdir_p and nothing else, so every
+ * retained copy of an OLD, possibly-vulnerable plugin was served over HTTP: a
+ * third-party scanner fetched a stashed plugin's readme.txt from a fleet site
+ * (200, real content) and a .php in the same tree answered 200/0 bytes — PHP
+ * EXECUTED it. Retention was never the bug; REACHABILITY was.
+ * (This file is public and ships to every site: the affected host, the plugin and
+ * the CVE are named in the private incident record, not here.)
+ * Invariant, enforced by zs_fleet_ue_stash_harden() on every stash and once per
+ * check-in cycle: the stash base is unreachable over HTTP at all times.
  *
  * Per-site opt-out: add_filter('zs_fleet_update_engine_enabled', '__return_false');
  */
@@ -353,6 +367,42 @@ function zs_fleet_ue_schema_sig( $tbls, $cols, $idx ) {
 	return sha1( zs_fleet_ue_canonical_json( array( $tbls, $cols, $idx ) ) );
 }
 
+/**
+ * Parse a stash dir NAME into { slug, version, ts }. Stashes are named
+ * '<slug>-<safever>-<unixtime>' and the SLUG ITSELF may contain hyphens
+ * ('mainwp-child-reports-1.2-171…'), so both cuts are taken from the RIGHT.
+ * Anything that does not parse returns null and the caller skips it — a name we
+ * cannot read is never guessed at.
+ *
+ * @param string $name basename of a stash dir.
+ * @return array|null { slug, version, ts } or null.
+ */
+function zs_fleet_ue_parse_stash_name( $name ) {
+	$cut_ts = strrpos( $name, '-' );
+	if ( $cut_ts === false ) {
+		return null;
+	}
+	$ts = substr( $name, $cut_ts + 1 );
+	if ( $ts === '' || ctype_digit( $ts ) !== true ) {
+		return null; // no trailing unixtime — not one of ours.
+	}
+	$head    = substr( $name, 0, $cut_ts );
+	$cut_ver = strrpos( $head, '-' );
+	if ( $cut_ver === false || $cut_ver === 0 ) {
+		return null; // no version segment, or an empty slug.
+	}
+	$slug    = substr( $head, 0, $cut_ver );
+	$version = substr( $head, $cut_ver + 1 );
+	if ( $slug === '' || $version === '' ) {
+		return null;
+	}
+	return array(
+		'slug'    => $slug,
+		'version' => $version,
+		'ts'      => (int) $ts,
+	);
+}
+
 /* ──────────────────────────────────────────────────────────────────────────
  * SIGNATURE
  * ────────────────────────────────────────────────────────────────────────── */
@@ -609,12 +659,72 @@ function zs_fleet_ue_live_path( $slug, $base = null ) {
 	return $live;
 }
 
+/**
+ * Make the stash base unreachable over HTTP. Idempotent, and cheap enough to call
+ * on every check-in: one stat and zero syscalls once a site is hardened.
+ *
+ * Incident 2026-08-23 (see the reachability invariant at the top of this file):
+ * the base was created with wp_mkdir_p and nothing else, so retained copies of old
+ * plugin versions were publicly fetchable AND executable on all 16 sites.
+ *
+ * Three mechanisms, because no single one covers every host we run on:
+ *  - chmod 0700 on the BASE is the load-bearing half. The 15 internal sites run
+ *    OpenLiteSpeed, which does not read .htaccess AT ALL — probed live on the real
+ *    fleet 2026-08-23: both 'Require all denied' and 'Order allow,deny / Deny from
+ *    all' still served the file with a 200 byte-identical to the control. With the
+ *    base at 0700 the web server cannot traverse it (children 404 even at 0755),
+ *    while PHP, running as the site user, still reads every file.
+ *  - .htaccess deny for Apache / LiteSpeed Enterprise — the one external site
+ *    today, and the unknown hosts this fleet is meant to scale onto. Both syntaxes,
+ *    each in its own IfModule, the way WP core writes them.
+ *  - index.php because listings are already off fleet-wide, so it adds nothing on
+ *    its own — but it is free and conventional.
+ *
+ * The guards are FILES on purpose: zs_fleet_ue_prune_stashes() and
+ * zs_fleet_ue_latest_stash() glob with GLOB_ONLYDIR, so a file is invisible to
+ * both and can never be mistaken for a stash.
+ *
+ * Writes are @-suppressed: a read-only filesystem must degrade, never fatal the cron.
+ *
+ * @param string $base absolute path to an existing stash base dir.
+ * @return bool true when the base is 0700 AND the .htaccess guard is in place.
+ */
+function zs_fleet_ue_stash_harden( $base ) {
+	$mode   = @fileperms( $base );
+	$locked = ( $mode !== false && ( $mode & 0777 ) === 0700 );
+	if ( ! $locked ) {
+		$locked = (bool) @chmod( $base, 0700 );
+	}
+
+	$htaccess = trailingslashit( $base ) . '.htaccess';
+	$ht_ok    = file_exists( $htaccess );
+	if ( ! $ht_ok ) {
+		$ht_ok = @file_put_contents(
+			$htaccess,
+			"# zs-fleet stash: rollback copies of OLD plugin versions. Never web-reachable.\n"
+			. "<IfModule mod_authz_core.c>\n\tRequire all denied\n</IfModule>\n"
+			. "<IfModule !mod_authz_core.c>\n\tOrder allow,deny\n\tDeny from all\n</IfModule>\n"
+		) !== false;
+	}
+
+	$index = trailingslashit( $base ) . 'index.php';
+	if ( ! file_exists( $index ) ) {
+		@file_put_contents( $index, "<?php\n// Silence is golden.\n" );
+	}
+
+	return $locked && $ht_ok;
+}
+
 /** Absolute path to the stash base dir, created if missing. WP_Error on fail. */
 function zs_fleet_ue_stash_base() {
 	$base = trailingslashit( WP_CONTENT_DIR ) . ZS_FLEET_UE_STASH_SUBDIR;
 	if ( ! is_dir( $base ) && ! wp_mkdir_p( $base ) ) {
 		return new WP_Error( 'stash_mkdir', "cannot create stash dir {$base}" );
 	}
+	// OUTSIDE the guard above, on purpose: the && short-circuits, so on every site
+	// where the dir already exists wp_mkdir_p never runs — hardening placed inside
+	// that branch would not have executed on a single live site (incident 2026-08-23).
+	zs_fleet_ue_stash_harden( $base );
 	return $base;
 }
 
@@ -811,6 +921,71 @@ function zs_fleet_ue_prune_stashes( $slug ) {
 	foreach ( $drop as $d ) {
 		zs_fleet_ue_rrmdir( $d );
 	}
+}
+
+/**
+ * What is lying around in the stash — the first time this tree is visible to our
+ * own tooling at all. Until 2026-08-23 the stash was structurally invisible: no
+ * check-in field described it, so nobody could see that 16 sites were serving old
+ * plugin copies until an outside scanner said so.
+ *
+ * Computed from the dir NAMES only: no recursive walk, no byte counting. This runs
+ * hourly on every enrolled site, several of them on shared hosting.
+ *
+ *   count       int   parseable stash dirs present
+ *   oldest_age  int   seconds since the oldest stash's trailing unixtime
+ *   protected   bool  base is 0700 AND the .htaccess guard exists
+ *   items       array deduplicated { slug, version } — WHICH old versions are here
+ *
+ * `items` is deliberately NOT folded into the detect() `plugins` array: that array
+ * is load-bearing for cohort derivation in the control-plane and renders as
+ * INSTALLED PLUGINS with a per-row rollback button, so a stash row there would
+ * poison cohorts and offer to roll back something that is not installed.
+ *
+ * @return array
+ */
+function zs_fleet_ue_stash_summary() {
+	$base = trailingslashit( WP_CONTENT_DIR ) . ZS_FLEET_UE_STASH_SUBDIR;
+	$out  = array(
+		'count'      => 0,
+		'oldest_age' => 0,
+		'protected'  => false,
+		'items'      => array(),
+	);
+	if ( ! is_dir( $base ) ) {
+		return $out; // never stashed — nothing to protect, nothing to report.
+	}
+
+	$mode             = @fileperms( $base );
+	$out['protected'] = ( $mode !== false && ( $mode & 0777 ) === 0700 )
+		&& file_exists( trailingslashit( $base ) . '.htaccess' );
+
+	$dirs = glob( $base . '/*', GLOB_ONLYDIR );
+	if ( ! $dirs ) {
+		return $out;
+	}
+	$now  = time();
+	$seen = array();
+	foreach ( $dirs as $dir ) {
+		$parsed = zs_fleet_ue_parse_stash_name( basename( $dir ) );
+		if ( $parsed === null ) {
+			continue; // unreadable name — skipped, never guessed (and never counted).
+		}
+		++$out['count'];
+		$age = $now - $parsed['ts'];
+		if ( $age > $out['oldest_age'] ) {
+			$out['oldest_age'] = $age;
+		}
+		$key = $parsed['slug'] . '@' . $parsed['version'];
+		if ( ! isset( $seen[ $key ] ) ) {
+			$seen[ $key ]   = true;
+			$out['items'][] = array(
+				'slug'    => $parsed['slug'],
+				'version' => $parsed['version'],
+			);
+		}
+	}
+	return $out;
 }
 
 /**
@@ -2204,6 +2379,8 @@ function zs_fleet_ue_detect() {
 		'php_version'    => PHP_VERSION,
 		'plugins'        => $plugins,
 		'themes'         => $themes,
+		// Own top-level key — see zs_fleet_ue_stash_summary() for why it is NOT in 'plugins'.
+		'stash'          => zs_fleet_ue_stash_summary(),
 	);
 }
 
@@ -2485,6 +2662,17 @@ function zs_fleet_ue_cron_run() {
 		// Durable retry of a pending sealed onboard secret (delivery net, independent
 		// of the manifest that minted it — M1). Runs every enrolled cycle until 2xx-acked.
 		zs_fleet_ue_onboard_retry_delivery();
+
+		// Stash reachability self-heal. zs_fleet_ue_stash_base() only runs during an
+		// APPLY, so a site whose plugins never update again would keep an exposed stash
+		// forever — precisely how the 2026-08-23 exposure survived. This slot runs on
+		// every enrolled site every cycle, above all three return paths below.
+		// is_dir-guarded: harden what exists, never create an empty stash dir on a site
+		// that has never stashed.
+		$zs_stash_base = trailingslashit( WP_CONTENT_DIR ) . ZS_FLEET_UE_STASH_SUBDIR;
+		if ( is_dir( $zs_stash_base ) ) {
+			zs_fleet_ue_stash_harden( $zs_stash_base );
+		}
 
 		$env = zs_fleet_ue_pull_envelope();
 		if ( is_wp_error( $env ) ) {

@@ -119,5 +119,48 @@ check( zs_fleet_ue_restore_plugin( '.', $stash ) === false, 'restore refuses uns
 /* ── 6. live still intact + active-plugin-shaped after the whole dance ── */
 check( file_get_contents( "$live/includes/core.php" ) === "core-v1\n", 'live content is the original version' );
 
+/* ── 7. the stash base is unreachable over HTTP (incident 2026-08-23) ── */
+$base = WP_CONTENT_DIR . '/zs-fleet-stash';
+clearstatcache();
+check( ( fileperms( $base ) & 0777 ) === 0700, 'stash base is 0700 after a stash (the load-bearing guard)' );
+check( file_exists( "$base/.htaccess" ), '.htaccess guard written' );
+check( file_exists( "$base/index.php" ), 'index.php guard written' );
+$ht = file_get_contents( "$base/.htaccess" );
+check(
+	strpos( $ht, 'Require all denied' ) !== false && strpos( $ht, 'Deny from all' ) !== false,
+	'.htaccess covers both mod_authz_core and the legacy Order/Deny syntax'
+);
+check( count( glob( "$base/*", GLOB_ONLYDIR ) ) === 1, 'guards are FILES — invisible to the GLOB_ONLYDIR stash scans' );
+
+/* ── 8. hardening is idempotent (it runs on every stash AND every check-in) ── */
+check( zs_fleet_ue_stash_harden( $base ) === true, 'harden() returns true on an already-hardened base' );
+check( file_get_contents( "$base/.htaccess" ) === $ht, 'second harden() does not rewrite or duplicate the guard' );
+check(
+	count( array_diff( scandir( $base ), array( '.', '..' ) ) ) === 3,
+	'still exactly one stash dir + two guard files (nothing appended, nothing duplicated)'
+);
+
+/* ── 9. self-heal: a base that drifted back to 0755 is re-locked ── */
+@chmod( $base, 0755 );
+clearstatcache();
+check( zs_fleet_ue_stash_summary()['protected'] === false, 'summary reports a drifted base honestly (not protected)' );
+check( zs_fleet_ue_stash_harden( $base ) === true, 'harden() re-locks the drifted base' );
+clearstatcache();
+check( ( fileperms( $base ) & 0777 ) === 0700, 'base is 0700 again after the per-cycle self-heal' );
+
+/* ── 10. summary reads the dir NAMES: hyphenated slugs, dedup, malformed skipped ── */
+$now = time();
+@mkdir( "$base/mainwp-child-reports-1.2.3-" . ( $now - 3600 ), 0777, true ); // slug with hyphens
+@mkdir( "$base/mainwp-child-reports-1.2.3-" . ( $now - 60 ), 0777, true );   // same pair, newer → dedup
+@mkdir( "$base/not-a-stash", 0777, true );                                    // unparseable → skipped
+$sum   = zs_fleet_ue_stash_summary();
+$slugs = array_column( $sum['items'], 'slug' );
+check( $sum['count'] === 3, 'summary counts the 3 parseable stashes and not the malformed dir' );
+check( count( $sum['items'] ) === 2, 'summary deduplicates {slug, version} pairs' );
+check( in_array( 'mainwp-child-reports', $slugs, true ), 'hyphenated slug parsed whole (split from the RIGHT)' );
+check( ! in_array( 'not', $slugs, true ) && ! in_array( 'not-a', $slugs, true ), 'malformed dir name skipped, never guessed' );
+check( $sum['oldest_age'] >= 3600, 'oldest_age comes from the trailing unixtime of the oldest dir' );
+check( $sum['protected'] === true, 'summary reports the re-locked base as protected' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );

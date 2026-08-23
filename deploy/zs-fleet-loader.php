@@ -118,8 +118,14 @@ function zs_fleet_loader_do_install( $mu_dir ) {
 		return;
 	}
 
+	// get_temp_dir() falls back to WP_CONTENT_DIR when sys_get_temp_dir() is not
+	// writable — the shared-hosting case, and exactly where this bootstrap runs. So
+	// this tree can land INSIDE THE DOCROOT: 0700 while it exists, and removed on
+	// EVERY path below, success included. It used to be removed on none of them,
+	// which left a full extracted release publicly reachable forever (incident
+	// 2026-08-23 — same class as the engine stash).
 	$extract_dir = trailingslashit( get_temp_dir() ) . 'zs-fleet-bootstrap-' . uniqid();
-	if ( ! mkdir( $extract_dir, 0755, true ) ) {
+	if ( ! mkdir( $extract_dir, 0700, true ) ) {
 		@unlink( $tmp_zip );
 		error_log( '[zs-fleet] bootstrap: tmp mkdir failed' );
 		return;
@@ -129,22 +135,54 @@ function zs_fleet_loader_do_install( $mu_dir ) {
 	$unzip = unzip_file( $tmp_zip, $extract_dir );
 	@unlink( $tmp_zip );
 	if ( is_wp_error( $unzip ) ) {
+		zs_fleet_loader_rrmdir( $extract_dir );
 		error_log( '[zs-fleet] bootstrap: unzip failed: ' . $unzip->get_error_message() );
 		return;
 	}
 
 	$staged = $extract_dir . '/zs-fleet';
 	if ( ! is_dir( $staged ) || ! file_exists( $staged . '/zs-fleet.php' ) ) {
+		zs_fleet_loader_rrmdir( $extract_dir );
 		error_log( '[zs-fleet] bootstrap: extracted zip is malformed' );
 		return;
 	}
 
 	if ( ! @rename( $staged, $mu_dir . '/zs-fleet' ) ) {
+		zs_fleet_loader_rrmdir( $extract_dir );
 		error_log( '[zs-fleet] bootstrap: rename into mu-plugins/ failed' );
 		return;
 	}
 
+	// $staged was renamed OUT of $extract_dir above — what is left is the empty
+	// parent (plus any siblings the zip carried), never the installed plugin.
+	zs_fleet_loader_rrmdir( $extract_dir );
+
 	error_log( '[zs-fleet] bootstrap: installed from GitHub release' );
+}
+
+/**
+ * Recursive rmdir. Standalone copy of modules/auto-update.php's helper, for the
+ * same reason zs_fleet_loader_verify_zip_signature() is one: during a first-install
+ * the zs-fleet modules are not on disk yet.
+ */
+function zs_fleet_loader_rrmdir( $path ) {
+	if ( ! file_exists( $path ) && ! is_link( $path ) ) {
+		return;
+	}
+	if ( is_file( $path ) || is_link( $path ) ) {
+		@unlink( $path );
+		return;
+	}
+	$entries = scandir( $path );
+	if ( $entries ) {
+		foreach ( $entries as $f ) {
+			if ( $f === '.' || $f === '..' ) {
+				continue;
+			}
+			zs_fleet_loader_rrmdir( $path . '/' . $f );
+		}
+	}
+	@rmdir( $path );
 }
 
 /**

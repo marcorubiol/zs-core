@@ -212,6 +212,8 @@ function zs_fleet_au_run() {
 function zs_fleet_au_check_and_apply() {
 	require_once ABSPATH . 'wp-admin/includes/file.php';
 
+	zs_fleet_au_sweep_stale_swaps();
+
 	$tmp_zip = wp_tempnam( 'zs-fleet-check.zip' );
 	$dl      = wp_remote_get(
 		ZS_FLEET_AU_ZIP_URL,
@@ -260,9 +262,11 @@ function zs_fleet_au_check_and_apply() {
 	// shared hosts like Hostinger) → the install rename() fails with EXDEV and the swap
 	// aborts + rolls back, so the site never self-updates. A dot-prefixed staging dir
 	// under WPMU_PLUGIN_DIR is not scanned by WordPress (top-level *.php only) and is
-	// removed on every path below.
+	// removed on every path below. Mode 0700, not 0755: that dot prefix hides it from
+	// WordPress, not from the web server — mu-plugins/ is inside the docroot
+	// (incident 2026-08-23).
 	$tmp_dir = trailingslashit( WPMU_PLUGIN_DIR ) . '.zs-fleet-stage-' . uniqid();
-	if ( ! mkdir( $tmp_dir, 0755, true ) ) {
+	if ( ! mkdir( $tmp_dir, 0700, true ) ) {
 		@unlink( $tmp_zip );
 		return new WP_Error( 'mkdir_tmp', 'could not create extraction dir' );
 	}
@@ -293,15 +297,26 @@ function zs_fleet_au_check_and_apply() {
 		return false;
 	}
 
-	$live  = WPMU_PLUGIN_DIR . '/zs-fleet';
-	$stash = WPMU_PLUGIN_DIR . "/zs-fleet.old-{$remote_version}";
+	$live = WPMU_PLUGIN_DIR . '/zs-fleet';
+	// Dot-prefixed AND locked down the moment it exists. This is a full copy of the
+	// PREVIOUS agency plugin, and mu-plugins/ is inside the docroot: the happy path
+	// deletes it three lines down, but a fatal or a timeout in between used to leave
+	// it publicly readable forever (incident 2026-08-23 — the engine-stash exposure,
+	// same class). Stays inside WPMU_PLUGIN_DIR so the rename is same-fs (the
+	// Hostinger EXDEV constraint documented above the staging dir).
+	$stash = WPMU_PLUGIN_DIR . "/.zs-fleet.old-{$remote_version}";
+	$mode  = @fileperms( $live );
+	$mode  = ( $mode === false ) ? 0755 : ( $mode & 0777 );
 
 	if ( ! @rename( $live, $stash ) ) {
 		zs_fleet_au_rrmdir( $tmp_dir );
 		return new WP_Error( 'swap_stash', 'could not stash live zs-fleet directory' );
 	}
+	@chmod( $stash, 0700 );
 	if ( ! @rename( $extracted, $live ) ) {
-		// Roll back: put the stash back.
+		// Roll back: restore the original mode first — we just locked the dir down and
+		// it is about to be the LIVE plugin again.
+		@chmod( $stash, $mode );
 		@rename( $stash, $live );
 		zs_fleet_au_rrmdir( $tmp_dir );
 		return new WP_Error( 'swap_install', 'could not install new zs-fleet, rolled back' );
@@ -398,6 +413,31 @@ function zs_fleet_au_log_error( $msg ) {
 		error_log(
 			'[zs-fleet] CRITICAL: no successful auto-update in >7 days at ' . home_url()
 		);
+	}
+}
+
+/**
+ * Remove leftovers of a crashed self-update: the aside-renamed copy of the previous
+ * zs-fleet. The swap removes its own scratch on every RETURN path, but a PHP fatal
+ * or a timeout between the rename and the rrmdir leaves the copy behind for good.
+ *
+ * Called at the TOP of every check, so the ordinary already-current daily run
+ * sweeps too — a leftover must not have to wait for the next real update.
+ * Both namings are swept: the un-prefixed one is what the fleet is carrying today.
+ */
+function zs_fleet_au_sweep_stale_swaps() {
+	$patterns = array(
+		WPMU_PLUGIN_DIR . '/.zs-fleet.old-*',
+		WPMU_PLUGIN_DIR . '/zs-fleet.old-*', // pre-2026-08-23 naming, still on disk out there.
+	);
+	foreach ( $patterns as $pattern ) {
+		$stale = glob( $pattern, GLOB_ONLYDIR );
+		if ( ! $stale ) {
+			continue;
+		}
+		foreach ( $stale as $dir ) {
+			zs_fleet_au_rrmdir( $dir );
+		}
 	}
 }
 

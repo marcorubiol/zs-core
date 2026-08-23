@@ -476,5 +476,27 @@ check( ZS_FLEET_UE_SEAL_PUBKEY !== '' && strlen( (string) base64_decode( ZS_FLEE
 check( is_array( ZS_FLEET_UE_ONBOARD_ACTIONS ) && ZS_FLEET_UE_ONBOARD_ACTIONS === array( 'flowguard' ), 'onboard action allowlist = [flowguard]' );
 check( ZS_FLEET_UE_ARTIFACT_MAX === 20971520, 'artifact size cap = 20 MiB' );
 
+/* ── stash dir-name parsing (incident 2026-08-23: the stash was invisible) ── */
+check(
+	zs_fleet_ue_parse_stash_name( 'akismet-5.3-1750000000' ) === array( 'slug' => 'akismet', 'version' => '5.3', 'ts' => 1750000000 ),
+	'parses <slug>-<version>-<unixtime>'
+);
+$hyphenated = zs_fleet_ue_parse_stash_name( 'mainwp-child-reports-1.2.3-1750000000' );
+check(
+	is_array( $hyphenated ) && $hyphenated['slug'] === 'mainwp-child-reports' && $hyphenated['version'] === '1.2.3',
+	'splits from the RIGHT: a slug may itself contain hyphens'
+);
+$sanitized = zs_fleet_ue_parse_stash_name( 'fluent-smtp-2.2.95_1-1750000000' );
+check(
+	is_array( $sanitized ) && $sanitized['slug'] === 'fluent-smtp' && $sanitized['version'] === '2.2.95_1',
+	'accepts a sanitized version segment (the stash writer replaces odd chars with _)'
+);
+check( zs_fleet_ue_parse_stash_name( 'no-trailing-timestamp' ) === null, 'no trailing unixtime → null (skipped, never guessed)' );
+check( zs_fleet_ue_parse_stash_name( 'onlyslug' ) === null, 'no hyphen at all → null' );
+check( zs_fleet_ue_parse_stash_name( 'acme-1750000000' ) === null, 'no version segment → null' );
+check( zs_fleet_ue_parse_stash_name( '-1.0-1750000000' ) === null, 'empty slug → null' );
+check( zs_fleet_ue_parse_stash_name( 'acme-1.0-' ) === null, 'empty timestamp → null' );
+check( zs_fleet_ue_parse_stash_name( 'acme-1.0-17500000x0' ) === null, 'non-numeric timestamp → null' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );
