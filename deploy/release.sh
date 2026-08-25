@@ -21,7 +21,7 @@
 #
 # Usage:
 #   deploy/release.sh 0.3.9                 cut + sign + verify + upload, then stop
-#   deploy/release.sh 0.3.9 --push          ...and run `zs-maintenance au-push` at the end
+#   deploy/release.sh 0.3.9 --push          ...and run fleet-toolkit au-push.sh at the end
 #   deploy/release.sh 0.3.9 --dry-run       print the plan, touch nothing
 #   deploy/release.sh 0.3.9 --canary        tag v0.3.9-canary (a hyphen => prerelease =>
 #                                           invisible to /latest => the fleet does NOT take it)
@@ -215,7 +215,16 @@ fi
 # ── 7. propagate (otherwise sites converge on their own daily cron within ~24h) ──
 step "propagate"
 if [ "$AUPUSH" = "1" ] && [ "$CANARY" = "0" ]; then
-  run "zs-maintenance au-push"
+  # Call the script by path, NOT via `zs-maintenance`: that is a zsh alias in Marco's
+  # interactive shell and this script runs under bash, so --push silently died with
+  # "command not found" on the v0.4.1 release — the release looked done and the fleet
+  # never got it. Resolve from the sibling repo, and say so if it is not there.
+  AU_PUSH="${ZS_FLEET_TOOLKIT:-$HOME/Developer/fleet-toolkit}/scripts/maintenance/au-push.sh"
+  if [ -x "$AU_PUSH" ]; then
+    run "'$AU_PUSH'"
+  else
+    echo "   au-push not found at $AU_PUSH — run it yourself, the fleet is NOT updated" >&2
+  fi
   echo "   note: any site not in sites.json (e.g. Fresh) converges on its own daily cron"
 elif [ "$CANARY" = "1" ]; then
   echo "   canary — nothing to propagate (install it by hand on the canary site)"
