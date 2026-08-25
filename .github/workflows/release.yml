@@ -38,6 +38,7 @@ jobs:
           php tests/test-engine-pure.php
           php tests/test-stash-restore.php
           php tests/test-proxy-https.php
+          php tests/test-no-admin-mods.php
 
       - name: Build release zip
         run: |

@@ -43,22 +43,44 @@
  *
  * Coexistence with legit update channels
  * --------------------------------------
- * Blocks apply only in browser context. Updates keep working through:
- *   - MainWP Child via XMLRPC   (defined XMLRPC_REQUEST)
- *   - MainWP Child via REST API (defined REST_REQUEST)
+ * Updates keep working through:
  *   - WP-CLI                    (defined WP_CLI)
  *   - WP-Cron                   (defined DOING_CRON — core auto-updates
- *                                 can still complete there)
+ *                                 can still complete there, and MainWP
+ *                                 Child self-defines DOING_CRON before
+ *                                 its own update routines)
+ *
+ * REST and XML-RPC USED to be exempt here too, "for MainWP Child". They were
+ * removed 2026-08-25 because that rationale was never true (audited against
+ * mainwp-child 6.1.1 on two sites):
+ *   - MainWP Child registers ZERO REST routes. Its transport is a signed
+ *     $_POST['function'] parsed on init:9999 — it never used wp-json.
+ *   - It never checks any capability in the blocked list below, and its update
+ *     paths call MainWP_Helper::maybe_set_doing_cron() first, so they are
+ *     exempt through DOING_CRON regardless.
+ *   - The XMLRPC branch was unreachable anyway: this same module 403-exits on
+ *     xmlrpc.php before the filter is ever registered.
+ * So the exemption cost real protection and bought nothing. What it cost: an
+ * Application Password authenticates ONLY when REST_REQUEST or XMLRPC_REQUEST
+ * is defined (wp-includes/user.php), so REST was the ENTIRE reachable surface
+ * of every app password on the fleet — and every one of them walked straight
+ * past this filter. On a client site that meant a phone holding a WooCommerce
+ * app password could POST /wp/v2/plugins.
  *
  * Residual risk
  * -------------
- * A stolen Application Password reaches the site via REST with admin
- * privileges → bypasses this plugin. Defense for that vector is App
- * Password rotation + 2FA, not capability filtering.
+ * The operator allowlist is checked INDEPENDENTLY of channel, so an Application
+ * Password belonging to an allowlisted operator account still carries every
+ * blocked capability over REST. That is the vector this module does not close,
+ * and on 2026-08-25 it was the live shape of things: the operator account holds
+ * app passwords named for FlowGuard, Novamira, SEO Utils and editor bridges —
+ * service credentials wearing the operator's identity. Closing it means giving
+ * those services their OWN non-operator user with only the capabilities they
+ * need, not more capability filtering. Until then: 2FA on those accounts and
+ * rotate their app passwords like any production credential.
  *
- * A compromise of one of the whitelisted operator accounts also bypasses
- * the filter — so keep 2FA on those accounts and rotate their App
- * Passwords with the same discipline as any production credential.
+ * A compromise of a whitelisted operator account bypasses the filter entirely,
+ * by design — that account is the escape hatch.
  *
  * To disable: delete this file from wp-content/mu-plugins/.
  * No other cleanup needed — the filters stop firing immediately.
@@ -142,11 +164,13 @@ function zs_no_admin_mods_blocked_caps() {
 }
 
 /**
- * Return true if the current request comes through a channel we
- * consider legit for updates (MainWP, WP-CLI, cron).
+ * Return true if the current request comes through a channel we consider legit
+ * for updates: WP-CLI and cron. Both are server-side and unreachable with a
+ * stolen credential, which is the whole test a channel has to pass to be here.
  *
- * We do NOT treat AJAX alone as legit — some WP admin screens trigger
- * plugin installs via admin-ajax.php, and we want those blocked too.
+ * We do NOT treat AJAX alone as legit — some WP admin screens trigger plugin
+ * installs via admin-ajax.php, and we want those blocked too. Nor REST, which
+ * carries every Application Password on the fleet (removed 2026-08-25).
  */
 function zs_no_admin_mods_is_legit_channel() {
 	if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -155,12 +179,9 @@ function zs_no_admin_mods_is_legit_channel() {
 	if ( defined( 'DOING_CRON' ) && DOING_CRON ) {
 		return true;
 	}
-	if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
-		return true;
-	}
-	if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
-		return true;
-	}
+	// REST and XML-RPC are deliberately NOT here — see the header. They were
+	// exempted for MainWP Child, which uses neither, and REST is the only channel
+	// an Application Password can ever authenticate on.
 	return false;
 }
 
