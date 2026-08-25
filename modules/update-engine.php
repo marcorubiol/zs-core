@@ -2378,6 +2378,9 @@ function zs_fleet_ue_core_update() {
 		'current'   => $current,
 		'available' => null,
 		'is_major'  => null,
+		// ISO timestamp of WordPress's last core check, or null when it has never run.
+		// null is NOT "up to date" — see the transient branch below.
+		'checked'   => null,
 		// What the site's own policy would do with it, so the control-plane never has
 		// to guess whether an offer is going to be taken.
 		'auto'      => ( defined( 'AUTOMATIC_UPDATER_DISABLED' ) && AUTOMATIC_UPDATER_DISABLED )
@@ -2387,8 +2390,15 @@ function zs_fleet_ue_core_update() {
 
 	$tr = get_site_transient( 'update_core' );
 	if ( ! isset( $tr->updates ) || ! is_array( $tr->updates ) ) {
-		return $out; // never checked yet — unknown, not "up to date".
+		// THE THIRD STATE, and it bit on the day this shipped: derbyqk and freshaccounting
+		// both had NO update_core transient at all, so they reported available=null exactly
+		// like a site that had checked and was current. A site that is not checking will not
+		// receive a security MINOR either, which is worse than a pending major. Never let
+		// "did not look" render as "nothing to see".
+		$out['checked'] = null;
+		return $out;
 	}
+	$out['checked'] = isset( $tr->last_checked ) ? gmdate( 'c', (int) $tr->last_checked ) : null;
 	foreach ( $tr->updates as $offer ) {
 		if ( ! isset( $offer->response ) || 'upgrade' !== $offer->response || empty( $offer->current ) ) {
 			continue;
