@@ -2328,6 +2328,31 @@ function zs_fleet_ue_consume_nonce( $nonce ) {
  * surfaces the flag so the control-plane knows whether the report is complete.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Version of the mu-plugins loader — the flat-to-subdirectory bridge that
+ * require_once's this bootstrap. WordPress only auto-loads top-level *.php in
+ * mu-plugins/, so the loader is the only part of zs-core that wp-admin can list,
+ * and (because self-update swaps zs-fleet/ underneath it) the only part nothing
+ * ever updates. It carries its own version line on purpose; this reads it so the
+ * control-plane can see the drift instead of nobody seeing it.
+ *
+ * @return string version, or 'unknown' when the file or its header is unreadable.
+ */
+function zs_fleet_ue_loader_version() {
+	if ( ! defined( 'WPMU_PLUGIN_DIR' ) ) {
+		return 'unknown';
+	}
+	$loader = trailingslashit( WPMU_PLUGIN_DIR ) . 'zs-fleet-loader.php';
+	if ( ! is_readable( $loader ) ) {
+		return 'unknown'; // installed flat, renamed, or symlinked — say so, do not guess.
+	}
+	// get_file_data() reads only the first 8KB and is the same parser wp-admin uses,
+	// so what we report is exactly what that Must-Use screen shows.
+	$data = get_file_data( $loader, array( 'version' => 'Version' ) );
+	$ver  = isset( $data['version'] ) ? trim( (string) $data['version'] ) : '';
+	return $ver !== '' ? $ver : 'unknown';
+}
+
 function zs_fleet_ue_detect() {
 	require_once ABSPATH . 'wp-admin/includes/plugin.php';
 	require_once ABSPATH . 'wp-admin/includes/theme.php';
@@ -2373,6 +2398,12 @@ function zs_fleet_ue_detect() {
 	return array(
 		'site'           => wp_parse_url( home_url(), PHP_URL_HOST ),
 		'engine_version' => defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : 'unknown',
+		// The loader is the ONE piece self-update never replaces (it swaps
+		// mu-plugins/zs-fleet/, and the loader sits above it), so it drifts silently
+		// and forever: 2026-08-25 found 13 sites on 0.2.0 and 3 on 0.2.2, months apart,
+		// with nothing anywhere able to say so. Reporting it is what makes the drift
+		// visible; propagating it is still a manual push.
+		'loader_version' => zs_fleet_ue_loader_version(),
 		'detected_at'    => gmdate( 'c' ),
 		'admin_context'  => is_admin(), // false → may undercount is_admin()-gated updaters.
 		'wp_version'     => get_bloginfo( 'version' ),
