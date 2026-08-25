@@ -2353,6 +2353,62 @@ function zs_fleet_ue_loader_version() {
 	return $ver !== '' ? $ver : 'unknown';
 }
 
+/**
+ * The WordPress core update WordPress itself is already offering.
+ *
+ * Core was structurally invisible to this whole system until 2026-08-25: the
+ * manifest only accepts 'plugin' and 'theme', and the control-plane's pending
+ * derivation only reads those two lists, so a core release could never become a
+ * decision. Meanwhile the hardening allows minor core auto-updates and blocks
+ * major ones — correct policy, but it left majors in the worst possible place:
+ * not applied, and not reported either. The fleet sat on 7.0.4 for six days
+ * after 7.0 stopped being supported, and nothing anywhere could say so.
+ *
+ * This does NOT make core updatable through the engine — deliberately, because
+ * a major core update is a decision, not a rollout. It makes it VISIBLE.
+ *
+ * Read from the transient WordPress already maintains: no HTTP request, no
+ * wp_version_check(), nothing added to the hourly cycle's cost.
+ *
+ * @return array { current, available|null, is_major|null, auto: 'minor'|'blocked'|'off' }
+ */
+function zs_fleet_ue_core_update() {
+	$current = get_bloginfo( 'version' );
+	$out     = array(
+		'current'   => $current,
+		'available' => null,
+		'is_major'  => null,
+		// What the site's own policy would do with it, so the control-plane never has
+		// to guess whether an offer is going to be taken.
+		'auto'      => ( defined( 'AUTOMATIC_UPDATER_DISABLED' ) && AUTOMATIC_UPDATER_DISABLED )
+			? 'off'
+			: ( apply_filters( 'allow_major_auto_core_updates', false ) ? 'major' : 'minor' ),
+	);
+
+	$tr = get_site_transient( 'update_core' );
+	if ( ! isset( $tr->updates ) || ! is_array( $tr->updates ) ) {
+		return $out; // never checked yet — unknown, not "up to date".
+	}
+	foreach ( $tr->updates as $offer ) {
+		if ( ! isset( $offer->response ) || 'upgrade' !== $offer->response || empty( $offer->current ) ) {
+			continue;
+		}
+		// Several locales can offer the same version; keep the highest offered.
+		if ( null === $out['available'] || version_compare( $offer->current, $out['available'], '>' ) ) {
+			$out['available'] = (string) $offer->current;
+		}
+	}
+	if ( null !== $out['available'] ) {
+		// major == the x.y branch moves. 7.0.4 -> 7.0.5 is minor and lands by itself;
+		// 7.0.4 -> 7.1 is major and will sit there forever until a human decides.
+		$a = explode( '.', $current );
+		$b = explode( '.', $out['available'] );
+		$out['is_major'] = ( ( isset( $a[0] ) ? $a[0] : '' ) . '.' . ( isset( $a[1] ) ? $a[1] : '' ) )
+			!== ( ( isset( $b[0] ) ? $b[0] : '' ) . '.' . ( isset( $b[1] ) ? $b[1] : '' ) );
+	}
+	return $out;
+}
+
 function zs_fleet_ue_detect() {
 	require_once ABSPATH . 'wp-admin/includes/plugin.php';
 	require_once ABSPATH . 'wp-admin/includes/theme.php';
@@ -2407,6 +2463,9 @@ function zs_fleet_ue_detect() {
 		'detected_at'    => gmdate( 'c' ),
 		'admin_context'  => is_admin(), // false → may undercount is_admin()-gated updaters.
 		'wp_version'     => get_bloginfo( 'version' ),
+		// Core is NOT applied by the engine (the manifest only accepts plugin/theme, on
+		// purpose). Reporting it is what stops a major sitting unseen — see the function.
+		'core'           => zs_fleet_ue_core_update(),
 		'php_version'    => PHP_VERSION,
 		'plugins'        => $plugins,
 		'themes'         => $themes,
