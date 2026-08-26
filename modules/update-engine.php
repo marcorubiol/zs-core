@@ -131,7 +131,18 @@ const ZS_FLEET_UE_SCHEDULE      = 'zs_fleet_ue';                 // custom cron 
 const ZS_FLEET_UE_INTERVAL_MIN  = 300;                           // 5 min floor
 const ZS_FLEET_UE_INTERVAL_MAX  = 86400;                         // 24 h ceiling
 const ZS_FLEET_UE_STASH_SUBDIR  = 'zs-fleet-stash';             // under wp-content. NOT under upgrade/ — WP_Upgrader::unpack_package() wipes EVERY child of wp-content/upgrade/ on each run, which would delete our rollback copy mid-flight.
-const ZS_FLEET_UE_STASH_KEEP    = 3;                              // retain N stashes/slug
+// Retain N stashes per slug. ONE, because one is all any code path can reach:
+// zs_fleet_ue_latest_stash() returns end($dirs) and is the sole resolver for rollback
+// mode, so the 2nd and 3rd copies were never readable by anything — they were pure
+// residue. And residue is not free: each one is a superseded, sometimes CVE-bearing
+// copy of a plugin sitting in a client docroot, and a filesystem scanner flags it
+// forever. That is how this surfaced (2026-08-26): Virusdie kept reporting FluentSMTP
+// out of date on sites whose live plugin was current, because the stash still held
+// 2.2.95. Locking the dir at 0700 stops the web server serving it; it does not stop a
+// scanner with file access from reading it. Fleet-wide this was 240 dirs, all
+// superseded by definition; pruning to one per slug dropped 102 of them and cost
+// nothing — rollback still resolved for every slug on every site, verified.
+const ZS_FLEET_UE_STASH_KEEP    = 1;
 
 add_action( 'init', 'zs_fleet_ue_schedule' );
 add_action( ZS_FLEET_UE_HOOK, 'zs_fleet_ue_cron_run' );

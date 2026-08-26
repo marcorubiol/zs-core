@@ -162,5 +162,28 @@ check( ! in_array( 'not', $slugs, true ) && ! in_array( 'not-a', $slugs, true ),
 check( $sum['oldest_age'] >= 3600, 'oldest_age comes from the trailing unixtime of the oldest dir' );
 check( $sum['protected'] === true, 'summary reports the re-locked base as protected' );
 
+/* ── 11. retention: ONE per slug, and the one kept is the reachable one ── */
+// The whole argument for KEEP=1 is that nothing can read an older copy: rollback mode
+// resolves through zs_fleet_ue_latest_stash(), which returns end($dirs). If someone
+// raises KEEP again, the extra copies are unreachable residue that a filesystem scanner
+// will flag forever — which is exactly how this surfaced (Virusdie, 2026-08-26).
+check( ZS_FLEET_UE_STASH_KEEP === 1, 'retention is ONE stash per slug (' . ZS_FLEET_UE_STASH_KEEP . ')' );
+
+$now = time();
+foreach ( array( 300, 200, 100 ) as $ago ) {
+	@mkdir( "$base/keeptest-1.0-" . ( $now - $ago ), 0777, true );
+}
+check( count( glob( "$base/keeptest-*", GLOB_ONLYDIR ) ) === 3, 'three stashes staged for the pruner' );
+
+// latest_stash must pick the NEWEST, which is the one the pruner keeps — same ordering.
+$latest = zs_fleet_ue_latest_stash( 'keeptest' );
+check( basename( $latest ) === 'keeptest-1.0-' . ( $now - 100 ), 'latest_stash resolves the NEWEST copy' );
+
+zs_fleet_ue_prune_stashes( 'keeptest' );
+$left = array_map( 'basename', glob( "$base/keeptest-*", GLOB_ONLYDIR ) );
+check( count( $left ) === 1, 'pruner leaves exactly one (' . count( $left ) . ')' );
+check( $left[0] === basename( $latest ), 'the survivor is the one latest_stash returns — no capability lost' );
+check( zs_fleet_ue_latest_stash( 'keeptest' ) === $latest, 'rollback still resolves after pruning' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );
