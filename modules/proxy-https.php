@@ -7,7 +7,7 @@
  *               is_ssl() gate) and hides the app-password admin UI — which blocks the
  *               fleet engine's FlowGuard onboard mint (M5) and any REST Basic-Auth on
  *               every Cloudflare-fronted site.
- * Version:      1.0.0
+ * Version:      1.1.0
  * Author:       Zerø Sense
  * Author URI:   https://zerosense.studio
  * License:      GPL-2.0-or-later
@@ -28,15 +28,29 @@
  *
  * Trust boundary (read this)
  * --------------------------
- * We only trip on:
- *   1. Cloudflare's CF-Visitor header ({"scheme":"https"}) — set by Cloudflare, or
- *   2. a generic X-Forwarded-Proto: https (fallback for a non-CF reverse proxy).
- * These headers are only trustworthy if the origin is NOT reachable directly: an
- * attacker able to hit the origin over plain HTTP could forge either header and make
- * WordPress believe the request is secure (then use a captured app-password over an
- * unencrypted link). This fleet is Cloudflare-fronted; the guarantee holds only while
- * the origin firewall accepts Cloudflare IP ranges ONLY. On an origin that is genuinely
- * HTTP-only (no proxy, no TLS anywhere) this module is inert — the headers are absent.
+ * We trip on Cloudflare's CF-Visitor header ({"scheme":"https"}) and nothing else.
+ * That header is only trustworthy if the origin is NOT reachable directly: an attacker
+ * able to hit the origin over plain HTTP can forge it and make WordPress believe the
+ * request is secure, then use a captured app-password over an unencrypted link. The
+ * guarantee holds only while the origin firewall accepts Cloudflare IP ranges ONLY.
+ * On an origin that is genuinely HTTP-only (no proxy, no TLS anywhere) this module is
+ * inert — the header is absent.
+ *
+ * ⚠ AS OF 2026-08-26 THAT PRECONDITION IS NOT MET ON THIS FLEET.
+ * Audited all 15 sites in the maintenance registry: the origin (152.53.150.2) answers
+ * plain HTTP from any address for any Host, and the shim demonstrably trips on a forged
+ * header — /wp-admin/ returns 301 without it and 302 with it, on every site. The origin
+ * has no IP filtering, so the same reachability also makes Cloudflare's WAF and the
+ * fleet's wp-login rate limit optional for anyone who addresses the IP directly.
+ *
+ * Checking REMOTE_ADDR against Cloudflare's ranges does NOT fix this. The fleet runs
+ * OpenLiteSpeed with useIpInProxyHeader = 2 and Cloudflare trusted, so a legitimate
+ * proxied request arrives with REMOTE_ADDR already rewritten to the visitor's address —
+ * not a Cloudflare one. Genuine and forged requests are indistinguishable at PHP level.
+ *
+ * The real fix is a secret the edge knows and a direct caller cannot: a Cloudflare
+ * Transform Rule adding a per-fleet header, checked here before the scheme is trusted.
+ * Until that exists, treat this module as convenience, not as a security boundary.
  *
  * Why a define() opt-out and not a filter
  * ---------------------------------------
@@ -68,13 +82,11 @@ function zs_fleet_proxy_says_https( array $server ) {
 			return true;
 		}
 	}
-	// Generic reverse proxy: take the first (client-most) value of a possible list.
-	if ( isset( $server['HTTP_X_FORWARDED_PROTO'] ) ) {
-		$proto = strtolower( trim( explode( ',', (string) $server['HTTP_X_FORWARDED_PROTO'] )[0] ) );
-		if ( 'https' === $proto ) {
-			return true;
-		}
-	}
+	// No generic X-Forwarded-Proto fallback. Every proxied site on this fleet sits
+	// behind Cloudflare and therefore sends CF-Visitor; the fallback bought nothing
+	// and widened what an attacker had to guess. Removing it does NOT make the
+	// module safe on a reachable origin — CF-Visitor is just as forgeable — it only
+	// stops the module answering to a header that no legitimate request here sends.
 	return false;
 }
 
