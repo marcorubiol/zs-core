@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ZS Core
  * Description: Modular MU-plugin that bundles fleet-wide hardening and policy modules. Each file in modules/ is auto-loaded.
- * Version:     0.4.2
+ * Version:     0.4.3
  * Author:      Zerø Sense
  * Author URI:  https://zerosense.studio
  * License:     GPL-2.0-or-later
@@ -29,7 +29,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ZS_FLEET_VERSION' ) ) {
-	define( 'ZS_FLEET_VERSION', '0.4.2' );   // MUST stay in sync with the Version: header above (auto-update compares header vs this constant)
+	define( 'ZS_FLEET_VERSION', '0.4.3' );   // MUST stay in sync with the Version: header above (auto-update compares header vs this constant)
 }
 
 if ( ! defined( 'ZS_FLEET_DIR' ) ) {
