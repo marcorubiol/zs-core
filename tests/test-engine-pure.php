@@ -498,5 +498,73 @@ check( zs_fleet_ue_parse_stash_name( '-1.0-1750000000' ) === null, 'empty slug �
 check( zs_fleet_ue_parse_stash_name( 'acme-1.0-' ) === null, 'empty timestamp → null' );
 check( zs_fleet_ue_parse_stash_name( 'acme-1.0-17500000x0' ) === null, 'non-numeric timestamp → null' );
 
+/* ── core.checked: a cleared update_core transient is NOT "never checked" ──── */
+// derbyqk and freshaccounting kept reporting core.checked=null (2026-08-25 → 2026-09-22),
+// derbyqk even two hours after a forced `wp cron event run wp_version_check`. WordPress
+// empties update_core on its own — Core_Upgrader::upgrade() deletes it, so does the
+// translation upgrade chained onto any plugin/theme upgrade (wp_clean_update_cache()),
+// and on an object-cache site it lives only in the cache, so any flush takes it too.
+// WordPress then re-checks from _maybe_update_core(), on admin_init only: never in the
+// cron context the check-in runs in.
+// Minimal model of the WordPress side, same semantics as wp-includes/update.php.
+$GLOBALS['zs_site_transients'] = array();
+$GLOBALS['zs_version_checks']  = 0;
+$GLOBALS['zs_wp_installing']   = false;
+function get_bloginfo( $show = '' ) {
+	return '7.1.1';
+}
+function get_site_transient( $key ) {
+	return isset( $GLOBALS['zs_site_transients'][ $key ] ) ? $GLOBALS['zs_site_transients'][ $key ] : false;
+}
+function delete_site_transient( $key ) {
+	unset( $GLOBALS['zs_site_transients'][ $key ] );
+}
+function wp_version_check() {
+	if ( $GLOBALS['zs_wp_installing'] ) {
+		return; // wp_installing(): WordPress starts no check at all.
+	}
+	$GLOBALS['zs_version_checks']++;
+	$GLOBALS['zs_site_transients']['update_core'] = (object) array(
+		'updates'         => array( (object) array( 'response' => 'latest', 'current' => '7.1.1' ) ),
+		'version_checked' => '7.1.1',
+		'last_checked'    => time(),
+	);
+}
+
+wp_version_check();                          // the forced check: WordPress did look…
+$forced_at = $GLOBALS['zs_site_transients']['update_core']->last_checked;
+delete_site_transient( 'update_core' );     // …then something emptied the transient.
+$GLOBALS['zs_version_checks'] = 0;
+$core = zs_fleet_ue_core_update();
+check( $core['checked'] !== null, 'cleared update_core: the check-in re-checks instead of reporting never-checked' );
+check( $GLOBALS['zs_version_checks'] === 1, 'cleared update_core: exactly one wp_version_check' );
+check( $core['available'] === null && $core['is_major'] === null, 'cleared update_core: re-checked and current → nothing available' );
+
+// A present transient is read as-is: no extra request to api.wordpress.org per cycle.
+$GLOBALS['zs_site_transients']['update_core'] = (object) array(
+	'updates'         => array(),
+	'version_checked' => '7.1.1',
+	'last_checked'    => $forced_at,
+);
+$GLOBALS['zs_version_checks'] = 0;
+$core = zs_fleet_ue_core_update();
+check( $GLOBALS['zs_version_checks'] === 0, 'present update_core: no wp_version_check' );
+check( $core['checked'] === gmdate( 'c', $forced_at ), 'present update_core: checked = its last_checked' );
+
+// The offer is still read from whatever the check stored.
+$GLOBALS['zs_site_transients']['update_core']->updates = array(
+	(object) array( 'response' => 'upgrade', 'current' => '7.1.2' ),
+	(object) array( 'response' => 'upgrade', 'current' => '7.2' ),
+);
+$core = zs_fleet_ue_core_update();
+check( $core['available'] === '7.2' && $core['is_major'] === true, 'present update_core: highest offer wins, 7.1 → 7.2 is major' );
+
+// Where WordPress will not check at all, null keeps meaning exactly that.
+delete_site_transient( 'update_core' );
+$GLOBALS['zs_wp_installing'] = true;
+$core = zs_fleet_ue_core_update();
+check( $core['checked'] === null, 'no check possible (wp_installing): checked stays null, never faked' );
+$GLOBALS['zs_wp_installing'] = false;
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );

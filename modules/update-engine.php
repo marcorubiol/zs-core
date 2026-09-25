@@ -2378,10 +2378,12 @@ function zs_fleet_ue_loader_version() {
  * This does NOT make core updatable through the engine — deliberately, because
  * a major core update is a decision, not a rollout. It makes it VISIBLE.
  *
- * Read from the transient WordPress already maintains: no HTTP request, no
- * wp_version_check(), nothing added to the hourly cycle's cost.
+ * Read from the transient WordPress already maintains. Only when that transient is
+ * gone does it run wp_version_check() — the one check WordPress's own
+ * _maybe_update_core() would run, except that hangs off admin_init and never fires
+ * in the cron context the check-in runs in. A healthy site pays no extra request.
  *
- * @return array { current, available|null, is_major|null, auto: 'minor'|'blocked'|'off' }
+ * @return array { current, available|null, is_major|null, checked|null, auto: 'minor'|'blocked'|'off' }
  */
 function zs_fleet_ue_core_update() {
 	$current = get_bloginfo( 'version' );
@@ -2401,11 +2403,21 @@ function zs_fleet_ue_core_update() {
 
 	$tr = get_site_transient( 'update_core' );
 	if ( ! isset( $tr->updates ) || ! is_array( $tr->updates ) ) {
-		// THE THIRD STATE, and it bit on the day this shipped: derbyqk and freshaccounting
-		// both had NO update_core transient at all, so they reported available=null exactly
-		// like a site that had checked and was current. A site that is not checking will not
-		// receive a security MINOR either, which is worse than a pending major. Never let
-		// "did not look" render as "nothing to see".
+		// A missing transient does not mean WordPress never looked. It empties update_core
+		// on its own: Core_Upgrader::upgrade() deletes it, so does the translation upgrade
+		// WordPress chains onto any plugin/theme upgrade (Language_Pack_Upgrader::async_upgrade
+		// → wp_clean_update_cache(), no re-check), and on an object-cache site it lives only
+		// in the cache, so a flush takes it too. Reading it passively is how derbyqk and
+		// freshaccounting reported null for a month, derbyqk two hours after a forced
+		// wp_version_check. Check the way _maybe_update_core() would, once, and re-read.
+		if ( function_exists( 'wp_version_check' ) ) {
+			wp_version_check();
+			$tr = get_site_transient( 'update_core' );
+		}
+	}
+	if ( ! isset( $tr->updates ) || ! is_array( $tr->updates ) ) {
+		// THE THIRD STATE: WordPress would not even start a check here (wp_installing()).
+		// Never let "did not look" render as "nothing to see".
 		$out['checked'] = null;
 		return $out;
 	}
