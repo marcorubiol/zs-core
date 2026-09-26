@@ -39,6 +39,7 @@ jobs:
           php tests/test-stash-restore.php
           php tests/test-proxy-https.php
           php tests/test-no-admin-mods.php
+          php tests/test-run-lock.php
 
       - name: Build release zip
         run: |

@@ -88,13 +88,13 @@ if [ "$DRY" = "0" ]; then
   docker run --rm -v "$ROOT":/app -w /app "$PHP_IMAGE" sh -c \
     "find zs-fleet.php modules deploy -name '*.php' -print0 | xargs -0 -n1 php -l" >/dev/null \
     || die "php -l failed"
-  for t in test-engine-pure.php test-stash-restore.php test-proxy-https.php test-no-admin-mods.php; do
+  for t in test-engine-pure.php test-stash-restore.php test-proxy-https.php test-no-admin-mods.php test-run-lock.php; do
     out="$(docker run --rm -v "$ROOT":/app -w /app "$PHP_IMAGE" php "tests/$t" 2>&1 | tail -1)"
     echo "   $t: $out"
     case "$out" in *"0 failures"*) ;; *) die "$t failed" ;; esac
   done
 else
-  echo "   [dry-run] would run php -l + the 3 test files"
+  echo "   [dry-run] would run php -l + the test files"
 fi
 
 # ── 2. tag → CI builds the zip ──
