@@ -121,7 +121,8 @@ if ( ! defined( 'ZS_FLEET_UE_ARTIFACT_MAX' ) ) {
 }
 
 const ZS_FLEET_UE_HOOK          = 'zs_fleet_ue_pull';
-const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue_lock';
+const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue';                 // run lock → wp_options row `zs_fleet_ue.lock` (see zs_fleet_ue_lock_acquire)
+const ZS_FLEET_UE_LOCK_TTL      = 3600;                          // seconds before a lock whose holder died unreleased can be taken over
 const ZS_FLEET_UE_OPT_NONCES    = 'zs_fleet_ue_consumed_nonces'; // replay guard
 const ZS_FLEET_UE_OPT_REPORT    = 'zs_fleet_ue_last_report';
 const ZS_FLEET_UE_OPT_UNACKED   = 'zs_fleet_ue_unacked_report';  // last report not yet 2xx-acked by the control-plane
@@ -2736,19 +2737,47 @@ function zs_fleet_ue_cron_schedules( $schedules ) {
 	return $schedules;
 }
 
+/**
+ * Engine run lock: a wp_options row taken with WP_Upgrader::create_lock() (INSERT
+ * IGNORE, atomic in the DB — the lock WP_Automatic_Updater takes), NOT a transient.
+ * With a persistent object cache, transients live ONLY in the cache (LSCWP >= 7.8
+ * dropped "Store Transients"), and every LSCWP purge-all flushes it (Redis flushDb,
+ * Memcached the whole server), deleting a transient lock mid-run; get-then-set was
+ * not atomic either. A second run on top of the first re-applies the same manifest:
+ * its nonce is checked at the start and consumed only after the whole run.
+ *
+ * TTL (ZS_FLEET_UE_LOCK_TTL, one hour like core's auto_updater) only matters when the
+ * holder was killed from outside: fatals and exit() are released by the shutdown net
+ * in zs_fleet_ue_cron_run(). It must outlast a legitimate run — download_url() allows
+ * 300 s per package, plus up to 3×15 s of health probes per item — because a takeover
+ * of a live run is exactly the overlap this lock prevents; the old 10 min could be
+ * outlasted. The cost: an engine silent for up to an hour after a hard kill.
+ */
+function zs_fleet_ue_lock_acquire() {
+	if ( ! class_exists( 'WP_Upgrader' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/class-wp-upgrader.php';
+	}
+	return WP_Upgrader::create_lock( ZS_FLEET_UE_LOCK, ZS_FLEET_UE_LOCK_TTL );
+}
+
+function zs_fleet_ue_lock_release() {
+	WP_Upgrader::release_lock( ZS_FLEET_UE_LOCK );
+}
+
 function zs_fleet_ue_cron_run() {
 	if ( ! zs_fleet_ue_enabled() || ! zs_fleet_ue_enrolled() ) {
 		return; // inert until fully enrolled (control URL + pubkey + site token).
 	}
-	if ( get_transient( ZS_FLEET_UE_LOCK ) ) {
+	if ( ! zs_fleet_ue_lock_acquire() ) {
 		return;
 	}
-	set_transient( ZS_FLEET_UE_LOCK, 1, 10 * MINUTE_IN_SECONDS );
 
-	// Fatal-safety net: a PHP fatal inside Plugin_Upgrader (OOM, timeout, a plugin's
-	// own load error) does NOT run the try/finally below — but it DOES fire shutdown
-	// functions. Without this, the lock would sit until its 10-min TTL and strand the
-	// next cron cycle. Release the lock and drop a durable breadcrumb so the failure
+	// Shutdown net: a PHP fatal inside Plugin_Upgrader (OOM, timeout, a plugin's own
+	// load error) does NOT run the try/finally below, and neither does an exit()/die()
+	// anywhere in the run — but both DO fire shutdown functions. Without this, the lock
+	// would sit until its TTL and strand the following cycles. Reaching here with the
+	// flag unset means this process is ending without the finally, so the lock is
+	// released unconditionally; a fatal also drops a durable breadcrumb so the failure
 	// is visible and the fleet keeps moving. No-ops on the normal path via the flag.
 	$zs_lock_released = false;
 	register_shutdown_function(
@@ -2756,6 +2785,7 @@ function zs_fleet_ue_cron_run() {
 			if ( $zs_lock_released ) {
 				return; // normal completion already cleaned up in finally.
 			}
+			zs_fleet_ue_lock_release();
 			$err = error_get_last();
 			$is_fatal = is_array( $err ) && in_array(
 				$err['type'],
@@ -2765,7 +2795,6 @@ function zs_fleet_ue_cron_run() {
 			if ( ! $is_fatal ) {
 				return;
 			}
-			delete_transient( ZS_FLEET_UE_LOCK );
 			update_option(
 				'zs_fleet_ue_restore_pending',
 				array(
@@ -2816,7 +2845,7 @@ function zs_fleet_ue_cron_run() {
 		}
 		zs_fleet_ue_checkin( $report );
 	} finally {
-		delete_transient( ZS_FLEET_UE_LOCK );
+		zs_fleet_ue_lock_release();
 		$zs_lock_released = true; // tell the shutdown net the normal path handled cleanup.
 	}
 }
