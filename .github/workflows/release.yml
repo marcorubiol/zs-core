@@ -40,6 +40,7 @@ jobs:
           php tests/test-proxy-https.php
           php tests/test-no-admin-mods.php
           php tests/test-run-lock.php
+          php tests/test-page-cache.php
 
       - name: Build release zip
         run: |

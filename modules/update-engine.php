@@ -32,8 +32,11 @@
  *          if the copy fails (disk full), abort BEFORE touching live.
  *   APPLY  Plugin_Upgrader::upgrade(); capture was_active; reactivate.
  *   verify version==to AND active preserved AND http 200 AND fingerprint ok
+ *          (http = cache-busting probe, then bare / as a visitor gets it — a bad /
+ *          gets one page-cache purge + recheck before it counts, see clean_gate)
  *          ok   → applied (retain stash, prune old)
  *          fail → RESTORE stash → rolled_back   (restore-fail → error, scream)
+ *   after the LAST item: purge the page cache (LSCWP) + clean probe of / (report)
  *
  * ── Stash reachability invariant (incident 2026-08-23) ───────────────────
  * The stash sits under wp-content/ because WP_Upgrader wipes every child of
@@ -86,6 +89,14 @@ if ( ! defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ) {
 	// HTTP status the probe treats as healthy. Default 200; override only if the
 	// health URL legitimately answers with a different success code.
 	define( 'ZS_FLEET_UE_HEALTH_EXPECT', 200 );
+}
+if ( ! defined( 'ZS_FLEET_UE_CLEAN_PROBE' ) ) {
+	// Second post-apply probe: home_url('/') with NO query string and a browser UA —
+	// the request a visitor makes, so it is answered from the page cache when there
+	// is one (see zs_fleet_ue_clean_check). false → skip it on this site, e.g. one
+	// whose bare home legitimately answers non-200 to anonymous visitors (coming-soon,
+	// geo-redirect) and would otherwise roll back every good update.
+	define( 'ZS_FLEET_UE_CLEAN_PROBE', true );
 }
 
 /* ── Onboard mode (FlowGuard web-onboarding, Fleet v2) ───────────────────────
@@ -144,6 +155,10 @@ const ZS_FLEET_UE_STASH_SUBDIR  = 'zs-fleet-stash';             // under wp-cont
 // superseded by definition; pruning to one per slug dropped 102 of them and cost
 // nothing — rollback still resolved for every slug on every site, verified.
 const ZS_FLEET_UE_STASH_KEEP    = 1;
+// UA of the clean probe. A real browser string: the 8G firewall on these servers 403s
+// curl/wget/library UAs, and the point of that probe is to be served what a visitor is.
+const ZS_FLEET_UE_BROWSER_UA    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+const ZS_FLEET_UE_RECHECK_WAIT  = 3;                             // seconds between a purge and the clean re-probe
 
 add_action( 'init', 'zs_fleet_ue_schedule' );
 add_action( ZS_FLEET_UE_HOOK, 'zs_fleet_ue_cron_run' );
@@ -351,6 +366,24 @@ function zs_fleet_ue_verify_evidence( $to, $ver_after, $active_before, $active_a
 }
 
 /**
+ * Did this run touch files on disk (pure)? Then pages rendered while it ran may sit
+ * in the page cache and the run must purge it. Deliberately broad: a rolled-back or
+ * errored item had a mid-update window too, and a needless purge only costs a cold
+ * cache. Only shadow runs and items that never reached the upgrader are exempt.
+ */
+function zs_fleet_ue_run_touched_files( $mode, $results ) {
+	if ( $mode === 'shadow' ) {
+		return false;
+	}
+	foreach ( $results as $r ) {
+		if ( ! in_array( isset( $r['outcome'] ) ? $r['outcome'] : '', array( 'skipped', 'noop', 'drift' ), true ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
  * Schema signature (pure): a deterministic sha1 over the STRUCTURAL projection of
  * the database — table list, columns, indexes — that zs_fleet_ue_schema_signature()
  * pulls from information_schema. Used strictly as a SAME-SERVER before/after delta
@@ -517,7 +550,10 @@ function zs_fleet_ue_http_self() {
 		: home_url( '/' );
 	$expect = (int) ( defined( 'ZS_FLEET_UE_HEALTH_EXPECT' ) ? ZS_FLEET_UE_HEALTH_EXPECT : 200 );
 	for ( $attempt = 1; $attempt <= 3; $attempt++ ) {
-		$url   = add_query_arg( 'zs_fleet_probe', (string) ( time() + $attempt ), $base );
+		// Unique per request, not per second: two probes in the same second shared a
+		// value, so the second was a cache HIT on the first's entry — no PHP ran, which
+		// both skipped the health check and left a queued LSCWP purge undelivered.
+		$url   = add_query_arg( 'zs_fleet_probe', time() . '.' . mt_rand(), $base );
 		$start = microtime( true );
 		$resp  = wp_remote_get(
 			$url,
@@ -579,6 +615,143 @@ function zs_fleet_ue_health_blocked( $code, $body ) {
 	return false;
 }
 
+/* ── Page cache: purge + clean probe (incident 2026-10-01) ────────────────────
+ * A visitor request that hit / WHILE files were being swapped rendered the core
+ * critical-error page (500), and LiteSpeed Cache stored it under /. For ~13 min every
+ * anonymous visitor and Googlebot got it, while zs_fleet_ue_http_self() kept reading
+ * 200: its query string is a different cache key, so it never sees the cached /.
+ * Two fixes: purge the page cache after any run that touched files, and probe / the
+ * way a visitor does. No fatal reached the logs — this is a timing window, not a bad
+ * update, which is why a failing clean probe gets a purge-and-recheck before any
+ * rollback: restoring files does nothing to a page already in the cache.
+ */
+
+/**
+ * Purge the whole page cache when LiteSpeed Cache is active. Returns whether a purge
+ * was issued. URL purge is not enough: on 2026-10-01 `wp litespeed-purge url /` left
+ * the bad entry in place and only purge-all cleared it.
+ *
+ * DELIVERY: from cron (wp_doing_cron) or CLI, LSCWP cannot send its X-LiteSpeed-Purge
+ * header — it stores it in the `litespeed.purge.queue` option and the NEXT request that
+ * reaches PHP emits it (Core::__construct; checked in LSCWP 7.9.1). A cache HIT never
+ * reaches PHP, so every purge here must be followed by zs_fleet_ue_http_self(), whose
+ * unique query string always misses. Purge-all also flushes the object cache: safe for
+ * the run lock (a wp_options row, see zs_fleet_ue_lock_acquire) and for the
+ * update_* transients, which every apply deletes and re-fetches anyway.
+ */
+function zs_fleet_ue_purge_page_cache( $reason ) {
+	if ( ! has_action( 'litespeed_purge_all' ) ) {
+		return false;
+	}
+	if ( ! defined( 'LITESPEED_PURGE_SILENT' ) ) {
+		define( 'LITESPEED_PURGE_SILENT', true ); // no "Purged all caches" notice for the client admin.
+	}
+	do_action( 'litespeed_purge_all', 'zs-fleet: ' . $reason );
+	return true;
+}
+
+/**
+ * Visitor-shaped probe of the bare home: no query string, no no-cache headers, a
+ * browser UA — answered from the page cache when one holds /. One request, no retry:
+ * zs_fleet_ue_clean_check() owns the single recheck. Returns [code, seconds, body].
+ */
+function zs_fleet_ue_http_clean() {
+	$start = microtime( true );
+	$resp  = wp_remote_get(
+		home_url( '/' ),
+		array(
+			'timeout'     => 15,
+			'redirection' => 5,
+			'sslverify'   => false,
+			'headers'     => array(
+				'User-Agent' => ZS_FLEET_UE_BROWSER_UA,
+				'Accept'     => 'text/html,application/xhtml+xml',
+			),
+		)
+	);
+	$secs = round( microtime( true ) - $start, 3 );
+	if ( is_wp_error( $resp ) ) {
+		return array( 0, $secs, '' );
+	}
+	return array( (int) wp_remote_retrieve_response_code( $resp ), $secs, (string) wp_remote_retrieve_body( $resp ) );
+}
+
+/**
+ * Clean probe with one purge-and-recheck. Unhealthy = non-200 or a body failing the
+ * fingerprint (critical-error page in any language, truncated, db error). On the first
+ * failure: purge, deliver the purge (cache-busting probe), wait, probe again — so a
+ * page cached mid-update is cleared instead of blamed on the update. Cost: one request
+ * when healthy, three more when not. A blocked answer (8G/edge 401/403/429/challenge)
+ * is reported as such and never rechecked: it says nothing about the page.
+ *
+ * @return array|null {code, secs, body, healthy, blocked, purged}; null when disabled.
+ */
+function zs_fleet_ue_clean_check() {
+	if ( ! ZS_FLEET_UE_CLEAN_PROBE ) {
+		return null;
+	}
+	$purged = false;
+	for ( $pass = 1; $pass <= 2; $pass++ ) {
+		list( $code, $secs, $body ) = zs_fleet_ue_http_clean();
+		$blocked = zs_fleet_ue_health_blocked( $code, $body );
+		$healthy = ! $blocked && $code === 200 && zs_fleet_ue_fingerprint_ok( $body );
+		if ( $healthy || $blocked || $pass === 2 ) {
+			break;
+		}
+		$purged = zs_fleet_ue_purge_page_cache( 'clean probe recheck' );
+		if ( $purged ) {
+			zs_fleet_ue_http_self(); // delivers the queued purge (see zs_fleet_ue_purge_page_cache).
+		}
+		sleep( ZS_FLEET_UE_RECHECK_WAIT );
+	}
+	return array(
+		'code'    => $code,
+		'secs'    => $secs,
+		'body'    => $body,
+		'healthy' => $healthy,
+		'blocked' => $blocked,
+		'purged'  => $purged,
+	);
+}
+
+/**
+ * Per-item clean gate, run only when the cache-busting probe already passed. If the
+ * bare home is still unhealthy after purge-and-recheck, the clean result REPLACES
+ * $code/$secs/$body, so the caller's existing verdict sees a failed http/fingerprint
+ * gate and takes its existing path — rollback, or the no-rollback branch for db-touch
+ * and schema moves. The busted probe green with the bare home red after a purge means
+ * visitors get a broken page that PHP keeps producing for them (UA- or query-dependent
+ * code path) or a cache layer the purge cannot reach — not a page to leave up either
+ * way, and ZS_FLEET_UE_CLEAN_PROBE=false is the per-site exit if it is the latter.
+ * Blocked → noted, never gated: the busted probe
+ * already proved the render.
+ */
+function zs_fleet_ue_clean_gate( &$row, $slug, &$code, &$secs, &$body ) {
+	if ( (int) $code !== (int) ZS_FLEET_UE_HEALTH_EXPECT || ! zs_fleet_ue_fingerprint_ok( $body ) ) {
+		return; // already failing → the existing gates handle it.
+	}
+	$clean = zs_fleet_ue_clean_check();
+	if ( $clean === null ) {
+		return;
+	}
+	$row['http_clean'] = $clean['code'];
+	if ( $clean['healthy'] ) {
+		if ( $clean['purged'] ) {
+			$row['message'] .= 'clean probe of / healthy after purge (stale page cache cleared). ';
+		}
+		return;
+	}
+	if ( $clean['blocked'] ) {
+		$row['message'] .= 'clean probe of / blocked (HTTP ' . (int) $clean['code'] . '), not gated. ';
+		return;
+	}
+	$row['message'] .= 'clean probe of / unhealthy after purge+recheck (HTTP ' . (int) $clean['code'] . ', ' . ( zs_fleet_ue_fingerprint_reason( $clean['body'] ) ?: 'ok' ) . '). ';
+	error_log( '[zs-fleet] CRITICAL clean_probe_unhealthy for ' . $slug . ' at ' . home_url() . ' (HTTP ' . (int) $clean['code'] . ')' );
+	$code = $clean['code'];
+	$secs = $clean['secs'];
+	$body = $clean['body'];
+}
+
 /**
  * Raise time/memory ceilings before a real apply. Plugin_Upgrader can be slow on
  * a large premium zip; the default 30s/128M can trip a fatal mid-swap (which then
@@ -614,7 +787,14 @@ function zs_fleet_ue_fingerprint_reason( $body ) {
 	if ( stripos( $body, 'Parse error:' ) !== false ) {
 		return 'parse_error';
 	}
-	if ( stripos( $body, 'There has been a critical error' ) !== false || stripos( $body, 'Fatal error' ) !== false ) {
+	// The core critical-error page is TRANSLATED ("Ha habido un error crítico en esta
+	// web" on an ES site), so the English sentence alone misses it; wp_die()'s
+	// <body id="error-page"> is the language-independent marker. Incident 2026-10-01:
+	// that page was cached under / and served with a 500 for ~13 minutes.
+	if ( stripos( $body, 'There has been a critical error' ) !== false
+		|| stripos( $body, 'Ha habido un error crítico' ) !== false
+		|| stripos( $body, 'id="error-page"' ) !== false
+		|| stripos( $body, 'Fatal error' ) !== false ) {
 		return 'php_fatal';
 	}
 	// Minimal structural sanity — a rendered WP page closes the document.
@@ -1147,6 +1327,7 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	$ver_after            = zs_fleet_ue_disk_version( $pf );
 	$active_after         = is_plugin_active( $pf );
 	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
+	zs_fleet_ue_clean_gate( $row, $slug, $code, $secs, $body );
 	$fp_ok                = zs_fleet_ue_fingerprint_ok( $body );
 
 	$row['version_after']  = $ver_after;
@@ -1351,6 +1532,7 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	wp_clean_themes_cache( false );
 	$ver_after                  = (string) wp_get_theme( $slug )->get( 'Version' );
 	list( $code, $secs, $body ) = zs_fleet_ue_http_self();
+	zs_fleet_ue_clean_gate( $row, $slug, $code, $secs, $body );
 	$fp_ok                      = zs_fleet_ue_fingerprint_ok( $body );
 	$row['version_after']  = $ver_after;
 	$row['active_after']   = ( get_stylesheet() === $slug || get_template() === $slug );
@@ -2236,16 +2418,30 @@ function zs_fleet_ue_run( $manifest ) {
 			? zs_fleet_ue_apply_one_theme( $update, $mode )
 			: zs_fleet_ue_apply_one( $update, $mode );
 	}
+	// Purge AFTER the last item: a page rendered during any swap of this run may be in
+	// the cache, and a per-item purge would leave the next item's window open. The
+	// site_http probe right below is also what delivers the purge LSCWP queues in cron.
+	$touched = zs_fleet_ue_run_touched_files( $mode, $results );
+	$purged  = $touched ? zs_fleet_ue_purge_page_cache( 'engine run (' . $mode . ')' ) : null;
 	list( $code, $secs ) = zs_fleet_ue_http_self();
+	$clean = $touched ? zs_fleet_ue_clean_check() : null;
+	if ( $clean !== null && ! $clean['healthy'] && ! $clean['blocked'] ) {
+		// Reporting only: the items are already verified and settled, and which one to
+		// restore is unknowable here. Loud, so the operator looks at / now.
+		zs_fleet_ue_breadcrumb( '(run)', 'site_clean_unhealthy', array() );
+		error_log( '[zs-fleet] CRITICAL site_clean_unhealthy after run at ' . home_url() . ' (HTTP ' . (int) $clean['code'] . ')' );
+	}
 	return array(
-		'site'           => wp_parse_url( home_url(), PHP_URL_HOST ),
-		'engine_version' => defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : 'unknown',
-		'manifest_nonce' => isset( $manifest['nonce'] ) ? $manifest['nonce'] : '',
-		'ran_at'         => gmdate( 'c' ),
-		'mode'           => $mode,
-		'site_http'      => $code,
-		'site_http_time' => $secs,
-		'results'        => $results,
+		'site'            => wp_parse_url( home_url(), PHP_URL_HOST ),
+		'engine_version'  => defined( 'ZS_FLEET_VERSION' ) ? ZS_FLEET_VERSION : 'unknown',
+		'manifest_nonce'  => isset( $manifest['nonce'] ) ? $manifest['nonce'] : '',
+		'ran_at'          => gmdate( 'c' ),
+		'mode'            => $mode,
+		'site_http'       => $code,
+		'site_http_time'  => $secs,
+		'site_http_clean' => $clean !== null ? $clean['code'] : null, // bare / as a visitor gets it; null = not probed.
+		'cache_purged'    => $purged,                                 // null = run touched nothing; false = no LSCWP.
+		'results'         => $results,
 	);
 }
 
@@ -2749,7 +2945,8 @@ function zs_fleet_ue_cron_schedules( $schedules ) {
  * TTL (ZS_FLEET_UE_LOCK_TTL, one hour like core's auto_updater) only matters when the
  * holder was killed from outside: fatals and exit() are released by the shutdown net
  * in zs_fleet_ue_cron_run(). It must outlast a legitimate run — download_url() allows
- * 300 s per package, plus up to 3×15 s of health probes per item — because a takeover
+ * 300 s per package, plus up to ~2 min of health probes per item (3×15 s busted, and
+ * the clean probe's purge-and-recheck) — because a takeover
  * of a live run is exactly the overlap this lock prevents; the old 10 min could be
  * outlasted. The cost: an engine silent for up to an hour after a hard kill.
  */
