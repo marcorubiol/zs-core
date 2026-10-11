@@ -566,5 +566,23 @@ $core = zs_fleet_ue_core_update();
 check( $core['checked'] === null, 'no check possible (wp_installing): checked stays null, never faked' );
 $GLOBALS['zs_wp_installing'] = false;
 
+/* ── upgrader result: only `true` is success ────────────────────────────── */
+// A failed package download returns a non-result (NULL on WP 7.1.3), not a
+// WP_Error: it must be a failure carrying the skin's cause, never reach verify.
+check( zs_fleet_ue_upgrade_failure( true, array( 'Plugin updated successfully.' ) ) === '', 'upgrade true: no failure' );
+$f = zs_fleet_ue_upgrade_failure(
+	array(),
+	array(
+		'Downloading update from https://automaticcss.com/edd-sl/package_download/SECRET&#8230;',
+		'Download failed. Unauthorized',
+	)
+);
+check( $f !== '', 'upgrade array() (failed download): is a failure' );
+check( strpos( $f, 'Unauthorized' ) !== false, 'failed download: the skin cause reaches the message' );
+check( strpos( $f, 'SECRET' ) === false && strpos( $f, 'http' ) === false, 'failed download: package URL (licence) never reported' );
+check( zs_fleet_ue_upgrade_failure( null, array() ) !== '', 'upgrade null: is a failure' );
+check( strpos( zs_fleet_ue_upgrade_failure( false, array() ), 'returned false' ) !== false, 'upgrade false: is a failure' );
+check( zs_fleet_ue_upgrade_failure( new WP_Error( 'x', 'disk full' ), array() ) === 'upgrade error: disk full', 'upgrade WP_Error: its message' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );

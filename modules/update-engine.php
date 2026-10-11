@@ -1022,6 +1022,37 @@ function zs_fleet_ue_restore_plugin( $slug, $stash, $source_base = null ) {
 }
 
 /**
+ * Why a Plugin_Upgrader / Theme_Upgrader ::upgrade() call did not succeed, or ''
+ * if it did. Success is exactly `true`. A failed package download (expired
+ * premium licence, revoked package) makes WP_Upgrader::run() return its WP_Error
+ * WITHOUT filling $upgrader->result, so upgrade() returns a non-result (NULL on
+ * WP 7.1.3, measured): neither WP_Error nor false. Treated as success, that ran
+ * the verify step and surfaced as a misleading [version] gate failure (ACSS on ZERO, 2026-10-08/11).
+ * The real cause only reaches the skin, so its last messages are appended. Lines
+ * with a URL are dropped: "Downloading update from <package>" can carry a licence.
+ */
+function zs_fleet_ue_upgrade_failure( $result, $messages ) {
+	if ( $result === true ) {
+		return '';
+	}
+	if ( is_wp_error( $result ) ) {
+		return 'upgrade error: ' . $result->get_error_message();
+	}
+	$why  = ( $result === false ) ? 'upgrade returned false' : 'upgrade returned ' . gettype( $result ) . ', not true';
+	$keep = array();
+	foreach ( (array) $messages as $m ) {
+		$m = trim( (string) $m );
+		if ( $m !== '' && ! preg_match( '#https?://#i', $m ) ) {
+			$keep[] = $m;
+		}
+	}
+	if ( $keep ) {
+		$why .= ' (' . substr( implode( ' | ', array_slice( $keep, -3 ) ), 0, 300 ) . ')';
+	}
+	return $why;
+}
+
+/**
  * Unified rollback: restore the stash, reactivate, then RE-VERIFY the site is
  * actually healthy, and only then report 'rolled_back'. If the stash is missing,
  * the restore fails, or the post-restore site is still degraded → outcome
@@ -1295,22 +1326,14 @@ function zs_fleet_ue_apply_one( $update, $mode ) {
 	$upgrader = new Plugin_Upgrader( new Automatic_Upgrader_Skin() );
 	$result   = $upgrader->upgrade( $pf );
 
-	if ( is_wp_error( $result ) ) {
-		$row['message'] .= 'upgrade error: ' . $result->get_error_message() . '. ';
+	$fail = zs_fleet_ue_upgrade_failure( $result, $upgrader->skin->get_upgrade_messages() );
+	if ( $fail !== '' ) {
+		$row['message'] .= $fail . '. ';
 		if ( $touches_db ) {
 			$row['outcome'] = 'error';
 			return $row;
 		}
-		zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'upgrade error →' );
-		return $row;
-	}
-	if ( $result === false ) {
-		$row['message'] .= 'upgrade returned false. ';
-		if ( $touches_db ) {
-			$row['outcome'] = 'error';
-			return $row;
-		}
-		zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'upgrade false →' );
+		zs_fleet_ue_rollback( $row, $slug, $pf, isset( $stash ) ? $stash : '', $from, $active_before, 'upgrade failed →' );
 		return $row;
 	}
 
@@ -1523,8 +1546,9 @@ function zs_fleet_ue_apply_one_theme( $update, $mode ) {
 	$upgrader = new Theme_Upgrader( new Automatic_Upgrader_Skin() );
 	$result   = $upgrader->upgrade( $slug );
 
-	if ( is_wp_error( $result ) || $result === false ) {
-		$row['message'] .= 'theme upgrade ' . ( is_wp_error( $result ) ? 'error: ' . $result->get_error_message() : 'returned false' ) . '. ';
+	$fail = zs_fleet_ue_upgrade_failure( $result, $upgrader->skin->get_upgrade_messages() );
+	if ( $fail !== '' ) {
+		$row['message'] .= 'theme ' . $fail . '. ';
 		zs_fleet_ue_rollback_theme( $row, $slug, $stash, $from, $themes_dir, 'theme upgrade fail →' );
 		return $row;
 	}
