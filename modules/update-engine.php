@@ -136,6 +136,7 @@ const ZS_FLEET_UE_LOCK          = 'zs_fleet_ue';                 // run lock →
 const ZS_FLEET_UE_LOCK_TTL      = 3600;                          // seconds before a lock whose holder died unreleased can be taken over
 const ZS_FLEET_UE_OPT_NONCES    = 'zs_fleet_ue_consumed_nonces'; // replay guard
 const ZS_FLEET_UE_OPT_REPORT    = 'zs_fleet_ue_last_report';
+const ZS_FLEET_UE_OPT_WPML_REFRESH = 'zs_fleet_ue_wpml_refresh_at'; // last forced WPML installer refresh (unix time)
 const ZS_FLEET_UE_OPT_UNACKED   = 'zs_fleet_ue_unacked_report';  // last report not yet 2xx-acked by the control-plane
 const ZS_FLEET_UE_OPT_ONBOARD_UNACKED = 'zs_fleet_ue_onboard_unacked'; // sealed onboard secret not yet 2xx-acked (ciphertext ONLY, never plaintext)
 const ZS_FLEET_UE_OPT_INTERVAL  = 'zs_fleet_ue_interval';        // control-plane-driven check-in cadence (seconds)
@@ -410,6 +411,56 @@ function zs_fleet_ue_run_touched_files( $mode, $results ) {
  */
 function zs_fleet_ue_schema_sig( $tbls, $cols, $idx ) {
 	return sha1( zs_fleet_ue_canonical_json( array( $tbls, $cols, $idx ) ) );
+}
+
+/**
+ * Inter-plugin version floors (pure). WPML 5.x ships a wpml-dependencies.json in
+ * each of its plugins ({"<slug>": "<min version>"}) and, when an installed plugin
+ * is below a floor another one declares, silently switches the lower one off
+ * (String Translation stops: translated URLs 404, home still answers 200). Incident
+ * 2026-11-04..13: core and ST ended up on mismatched versions and no probe saw it.
+ * This makes any mismatch visible at every check-in, whoever caused it.
+ *
+ * A violation is: plugin P declares dep D >= min, D IS installed, and D's version
+ * (suffix like "-beta1" stripped, as WPML_Plugins_Check::is_below_floor does) is
+ * below min. A declared dep that is not installed is NOT a violation (core lists
+ * every optional add-on). Missing / malformed JSON, or a non-string entry, is
+ * skipped, never fatal.
+ *
+ * @param array $raw       slug => raw JSON string (or null when the file is absent).
+ * @param array $installed slug => installed version string.
+ * @return array { ok: bool, violations: [ {plugin, requires, min, installed} ] }
+ */
+function zs_fleet_ue_deps_check( $raw, $installed ) {
+	$violations = array();
+	foreach ( (array) $raw as $plugin => $json ) {
+		if ( ! is_string( $json ) || $json === '' ) {
+			continue;
+		}
+		$floors = json_decode( $json, true );
+		if ( ! is_array( $floors ) ) {
+			continue;
+		}
+		foreach ( $floors as $dep => $min ) {
+			if ( ! is_string( $dep ) || ! is_string( $min ) || $min === '' || ! isset( $installed[ $dep ] ) ) {
+				continue;
+			}
+			$have    = (string) $installed[ $dep ];
+			$release = (string) preg_replace( '/-.*$/', '', $have );
+			if ( version_compare( $release, $min, '<' ) ) {
+				$violations[] = array(
+					'plugin'    => (string) $plugin,
+					'requires'  => $dep,
+					'min'       => $min,
+					'installed' => $have,
+				);
+			}
+		}
+	}
+	return array(
+		'ok'         => $violations === array(),
+		'violations' => $violations,
+	);
 }
 
 /**
@@ -2466,6 +2517,7 @@ function zs_fleet_ue_run( $manifest ) {
 		'site_http_clean' => $clean !== null ? $clean['code'] : null, // bare / as a visitor gets it; null = not probed.
 		'cache_purged'    => $purged,                                 // null = run touched nothing; false = no LSCWP.
 		'results'         => $results,
+		'deps'            => zs_fleet_ue_deps(),                      // floors AFTER this run; report only, no gate.
 	);
 }
 
@@ -2663,11 +2715,76 @@ function zs_fleet_ue_core_update() {
 	return $out;
 }
 
+/**
+ * Dependency floors of the INSTALLED plugins (impure wrapper over the pure
+ * zs_fleet_ue_deps_check): reads each top-level <slug>/wpml-dependencies.json and
+ * the fresh installed versions. Report only, never a gate. On an unexpected error
+ * returns ok=null ("could not check"), so a consumer testing ok === false never
+ * alerts on it.
+ */
+function zs_fleet_ue_deps() {
+	try {
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+		// After an apply the per-request plugins cache still holds the old versions.
+		if ( function_exists( 'wp_clean_plugins_cache' ) ) {
+			wp_clean_plugins_cache( false );
+		}
+		$installed = array();
+		$raw       = array();
+		foreach ( get_plugins() as $file => $data ) {
+			$slug = dirname( $file );
+			if ( $slug === '.' ) {
+				continue;
+			}
+			$installed[ $slug ] = isset( $data['Version'] ) ? (string) $data['Version'] : '';
+			$path               = WP_PLUGIN_DIR . '/' . $slug . '/wpml-dependencies.json';
+			if ( is_readable( $path ) ) {
+				$json         = @file_get_contents( $path ); // phpcs:ignore
+				$raw[ $slug ] = is_string( $json ) ? $json : null;
+			}
+		}
+		return zs_fleet_ue_deps_check( $raw, $installed );
+	} catch ( \Throwable $e ) {
+		return array(
+			'ok'         => null,
+			'violations' => array(),
+		);
+	}
+}
+
+/**
+ * Force WPML's installer to re-read its repository (new versions), at most once per
+ * 24 h. With false it returns the stale cache; true is what surfaced 5.3.0 in
+ * production on 2026-11-13. The timestamp is stored BEFORE the call so a refresh that
+ * hangs or dies is not retried on every check-in. Best-effort, never fatal.
+ */
+function zs_fleet_ue_wpml_refresh() {
+	if ( ! function_exists( 'WP_Installer' ) ) {
+		return;
+	}
+	$last = (int) get_option( ZS_FLEET_UE_OPT_WPML_REFRESH, 0 );
+	if ( time() - $last < DAY_IN_SECONDS ) {
+		return;
+	}
+	update_option( ZS_FLEET_UE_OPT_WPML_REFRESH, time(), false );
+	try {
+		$installer = WP_Installer();
+		if ( is_object( $installer ) && method_exists( $installer, 'refresh_repositories_data' ) ) {
+			$installer->refresh_repositories_data( true );
+		}
+	} catch ( \Throwable $e ) {
+		error_log( '[zs-fleet] WPML installer refresh failed: ' . $e->getMessage() );
+	}
+}
+
 function zs_fleet_ue_detect() {
 	require_once ABSPATH . 'wp-admin/includes/plugin.php';
 	require_once ABSPATH . 'wp-admin/includes/theme.php';
 	require_once ABSPATH . 'wp-admin/includes/update.php';
 
+	zs_fleet_ue_wpml_refresh();
 	delete_site_transient( 'update_plugins' );
 	wp_update_plugins();
 	delete_site_transient( 'update_themes' );
@@ -2725,6 +2842,8 @@ function zs_fleet_ue_detect() {
 		'themes'         => $themes,
 		// Own top-level key — see zs_fleet_ue_stash_summary() for why it is NOT in 'plugins'.
 		'stash'          => zs_fleet_ue_stash_summary(),
+		// Inter-plugin version floors (wpml-dependencies.json) — see zs_fleet_ue_deps_check().
+		'deps'           => zs_fleet_ue_deps(),
 	);
 }
 

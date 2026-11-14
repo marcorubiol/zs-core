@@ -584,5 +584,60 @@ check( zs_fleet_ue_upgrade_failure( null, array() ) !== '', 'upgrade null: is a 
 check( strpos( zs_fleet_ue_upgrade_failure( false, array() ), 'returned false' ) !== false, 'upgrade false: is a failure' );
 check( zs_fleet_ue_upgrade_failure( new WP_Error( 'x', 'disk full' ), array() ) === 'upgrade error: disk full', 'upgrade WP_Error: its message' );
 
+/* ── WPML dependency floors (wpml-dependencies.json) ─────────────────────── */
+$core_json = '{"wpml-string-translation":"5.3.0","woocommerce-multilingual":"5.6.0","acfml":"5.2.0"}';
+$st_json   = '{"sitepress-multilingual-cms":"5.3.0"}';
+$d = zs_fleet_ue_deps_check(
+	array( 'sitepress-multilingual-cms' => $core_json, 'wpml-string-translation' => $st_json ),
+	array( 'sitepress-multilingual-cms' => '5.3.0', 'wpml-string-translation' => '5.3.0', 'acfml' => '5.2.1' )
+);
+check( $d === array( 'ok' => true, 'violations' => array() ), 'deps: all floors met → ok, no violations' );
+
+$d = zs_fleet_ue_deps_check(
+	array( 'sitepress-multilingual-cms' => $core_json, 'wpml-string-translation' => '{"sitepress-multilingual-cms":"5.2.0"}' ),
+	array( 'sitepress-multilingual-cms' => '5.3.0', 'wpml-string-translation' => '5.2.0' )
+);
+check(
+	$d['ok'] === false && $d['violations'] === array( array( 'plugin' => 'sitepress-multilingual-cms', 'requires' => 'wpml-string-translation', 'min' => '5.3.0', 'installed' => '5.2.0' ) ),
+	'deps: core needs ST 5.3.0, ST 5.2.0 installed → one violation, exact shape'
+);
+
+$d = zs_fleet_ue_deps_check(
+	array( 'sitepress-multilingual-cms' => '{"wpml-string-translation":"5.2.0"}', 'wpml-string-translation' => $st_json ),
+	array( 'sitepress-multilingual-cms' => '5.2.0', 'wpml-string-translation' => '5.3.0' )
+);
+check(
+	$d['ok'] === false && $d['violations'] === array( array( 'plugin' => 'wpml-string-translation', 'requires' => 'sitepress-multilingual-cms', 'min' => '5.3.0', 'installed' => '5.2.0' ) ),
+	'deps: ST needs core 5.3.0, core 5.2.0 installed → violation (the 04-11 direction)'
+);
+
+$d = zs_fleet_ue_deps_check(
+	array( 'sitepress-multilingual-cms' => $core_json ),
+	array( 'sitepress-multilingual-cms' => '5.3.0' )
+);
+check( $d['ok'] === true && $d['violations'] === array(), 'deps: declared dependency not installed → not a violation' );
+
+$d = zs_fleet_ue_deps_check(
+	array( 'wpml-string-translation' => $st_json ),
+	array( 'sitepress-multilingual-cms' => '5.3.0-beta1', 'wpml-string-translation' => '5.3.0' )
+);
+check( $d['ok'] === true, 'deps: 5.3.0-beta1 meets floor 5.3.0 (suffix stripped, as WPML does)' );
+$d = zs_fleet_ue_deps_check(
+	array( 'wpml-string-translation' => $st_json ),
+	array( 'sitepress-multilingual-cms' => '5.2.9-rc2', 'wpml-string-translation' => '5.3.0' )
+);
+check( $d['ok'] === false && $d['violations'][0]['installed'] === '5.2.9-rc2', 'deps: 5.2.9-rc2 below 5.3.0 → violation, reports the raw installed version' );
+
+$d = zs_fleet_ue_deps_check(
+	array(
+		'wpml-string-translation'    => '{"sitepress-multilingual-cms": ',
+		'acfml'                      => null,
+		'wpml-media-translation'     => '"5.0.0"',
+		'wpml-cms-nav'               => '{"sitepress-multilingual-cms": 5, "": "1.0"}',
+	),
+	array( 'sitepress-multilingual-cms' => '1.0', 'wpml-string-translation' => '5.3.0' )
+);
+check( $d === array( 'ok' => true, 'violations' => array() ), 'deps: malformed / missing / non-object / non-string JSON → skipped, never fatal' );
+
 echo "\n$tests tests, $fails failures\n";
 exit( $fails > 0 ? 1 : 0 );
